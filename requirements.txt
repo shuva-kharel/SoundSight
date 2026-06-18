@@ -1,0 +1,19 @@
+# SoundSight backend dependencies
+fastapi
+uvicorn[standard]
+ultralytics
+easyocr
+opencv-python
+websockets
+python-multipart
+cryptography    # generates the self-signed cert for HTTPS (browsers force it on localhost)
+google-genai    # Describe mode: Google Gemini vision API (needs GEMINI_API_KEY)
+gTTS            # Read mode: Nepali text-to-speech MP3 (needs internet; offline-swappable on the Pi)
+python-dotenv   # loads GEMINI_API_KEY etc. from a .env file in the project root
+
+# NOTE on PyTorch / GPU:
+# ultralytics pulls in `torch` automatically. The default CPU/cu12x wheels do
+# NOT support newer Blackwell GPUs (RTX 50-series, sm_120). If YOLO falls back
+# to CPU or errors on CUDA, install a matching torch build first, e.g.:
+#   pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128
+# See README.md for details.

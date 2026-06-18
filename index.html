@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SoundSight</title>
+<style>
+  :root { --bg:#000; --fg:#fff; --accent:#ffd400; --ok:#00c853; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: system-ui, sans-serif; text-align: center;
+  }
+  h1 { margin: .4em 0; font-size: 1.6rem; letter-spacing: .05em; }
+  #stage { position: relative; max-width: 720px; margin: 0 auto; }
+  #video, #overlay { width: 100%; display: block; border-radius: 8px; }
+  #overlay { position: absolute; top: 0; left: 0; pointer-events: none; }
+  #controls {
+    display: flex; gap: 12px; justify-content: center;
+    flex-wrap: wrap; margin: 16px auto; max-width: 720px; padding: 0 12px;
+  }
+  button.mode {
+    flex: 1 1 180px; min-height: 84px; font-size: 1.5rem; font-weight: 800;
+    color: #000; background: var(--fg); border: 4px solid var(--fg);
+    border-radius: 12px; cursor: pointer;
+  }
+  button.mode:focus-visible { outline: 5px solid var(--accent); outline-offset: 3px; }
+  button.mode[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); }
+  #status {
+    font-size: 1.25rem; padding: 14px; margin: 8px auto; max-width: 720px;
+    background: #111; border-radius: 8px; min-height: 1.6em;
+  }
+  .hint { color: #aaa; font-size: .95rem; margin-bottom: 24px; }
+</style>
+</head>
+<body>
+  <h1>👁️ SoundSight</h1>
+
+  <div id="stage">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div id="controls">
+    <button class="mode" id="btnNavigate" aria-pressed="false" accesskey="1">Navigate</button>
+    <button class="mode" id="btnRead"     aria-pressed="false" accesskey="2">Read</button>
+    <button class="mode" id="btnDescribe" aria-pressed="false" accesskey="3">Describe</button>
+    <button class="mode" id="btnRepeat"   accesskey="4">🔁 Repeat</button>
+  </div>
+
+  <div id="status" role="status" aria-live="assertive">Starting camera…</div>
+  <p class="hint">Keys: 1 = Navigate, 2 = Read, 3 = Describe, 4 = Repeat. Tap a mode again to stop.</p>
+
+<script>
+"use strict";
+
+const video   = document.getElementById("video");
+const overlay = document.getElementById("overlay");
+const octx    = overlay.getContext("2d");
+const statusEl= document.getElementById("status");
+
+const buttons = {
+  navigate: document.getElementById("btnNavigate"),
+  read:     document.getElementById("btnRead"),
+  describe: document.getElementById("btnDescribe"),
+};
+const btnRepeat = document.getElementById("btnRepeat");
+
+// Hidden canvas used to downscale frames before sending to the backend.
+const send = document.createElement("canvas");
+const sctx = send.getContext("2d");
+
+const SEND_WIDTH = 640;      // frames sent at 640px wide so small objects (pens, etc.) survive
+const FRAME_MS   = 150;      // ~6-7 fps is plenty and keeps speech calm
+
+let mode = null;             // "navigate" | "read" | "describe" | null
+let ws = null;
+let navTimer = null;
+let lastFrame = { fw: SEND_WIDTH, fh: SEND_WIDTH };
+
+let lastResult = null;       // {text, lang} from the last OCR -> used by Repeat
+let ttsAudio = null;         // <audio> currently playing a Nepali MP3
+
+function setStatus(msg) { statusEl.textContent = msg; }
+
+// --- Speech (Web Speech API) ------------------------------------------------
+function speak(text, { interrupt = false } = {}) {
+  if (!text) return;
+  // Stay calm: don't pile up utterances while one is already playing,
+  // unless we explicitly want to interrupt (Read / Describe).
+  if (interrupt) speechSynthesis.cancel();
+  else if (speechSynthesis.speaking || speechSynthesis.pending) return;
+  speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+}
+
+function stopTtsAudio() {
+  if (ttsAudio) { ttsAudio.pause(); ttsAudio = null; }
+}
+
+// Speak an OCR result in the right voice: English -> Web Speech API; Nepali ->
+// the /tts MP3 (the offline browser voice reads Devanagari poorly).
+async function speakResult(text, lang) {
+  if (!text) return;
+  if (lang === "ne") {
+    await speakNepali(text);
+  } else {
+    stopTtsAudio();
+    speak(text, { interrupt: true });
+  }
+}
+
+async function speakNepali(text) {
+  speechSynthesis.cancel();   // silence any English voice
+  stopTtsAudio();
+  try {
+    const form = new FormData();
+    form.append("text", text);
+    form.append("lang", "ne");
+    const resp = await fetch("/tts", { method: "POST", body: form });
+    if (!resp.ok) throw new Error("tts " + resp.status);
+    const url = URL.createObjectURL(await resp.blob());
+    ttsAudio = new Audio(url);
+    ttsAudio.addEventListener("ended", () => URL.revokeObjectURL(url));
+    await ttsAudio.play();
+  } catch (err) {
+    // gTTS needs internet; if it fails, fall back to the browser voice.
+    speak(text, { interrupt: true });
+  }
+}
+
+// --- Mode / action dispatch -------------------------------------------------
+// Navigate is a CONTINUOUS mode (a toggle). Read and Describe are ONE-SHOT
+// actions: they fire once and must NOT route back through the toggle, or they'd
+// cancel their own speech and wipe the status the moment they start.
+function setMode(next) {
+  if (next === "navigate") {
+    const turningOn = mode !== "navigate";
+    stopEverything();
+    mode = turningOn ? "navigate" : null;
+    updateButtons();
+    if (turningOn) startNavigate();
+    else { setStatus("Stopped."); speechSynthesis.cancel(); }
+    return;
+  }
+
+  // One-shot action: stop the continuous navigate loop, then fire once.
+  stopEverything();
+  mode = null;
+  updateButtons();
+  if (next === "read") doRead();
+  else if (next === "describe") describeScene();
+}
+
+function updateButtons() {
+  for (const [name, btn] of Object.entries(buttons)) {
+    btn.setAttribute("aria-pressed", String(name === mode));
+  }
+}
+
+function stopEverything() {
+  if (navTimer) { clearInterval(navTimer); navTimer = null; }
+  if (ws) { ws.close(); ws = null; }
+  stopTtsAudio();   // stop any Nepali MP3 still playing
+  octx.clearRect(0, 0, overlay.width, overlay.height);
+}
+
+// --- Navigate mode ----------------------------------------------------------
+function startNavigate() {
+  setStatus("Navigate: connecting…");
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/ws/navigate`);
+
+  ws.onopen    = () => { setStatus("Navigate: scanning…"); navTimer = setInterval(sendFrame, FRAME_MS); };
+  ws.onclose   = () => { if (mode === "navigate") setStatus("Navigate: connection closed."); };
+  ws.onerror   = () => setStatus("Navigate: connection error.");
+  ws.onmessage = (e) => handleDetections(JSON.parse(e.data));
+}
+
+function sendFrame() {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !video.videoWidth) return;
+  const scale = SEND_WIDTH / video.videoWidth;
+  send.width  = SEND_WIDTH;
+  send.height = Math.round(video.videoHeight * scale);
+  sctx.drawImage(video, 0, 0, send.width, send.height);
+  ws.send(send.toDataURL("image/jpeg", 0.6));
+}
+
+function handleDetections(msg) {
+  lastFrame = { fw: msg.fw, fh: msg.fh };
+  drawBoxes(msg.boxes || []);
+
+  // speak is now a list of {text, rate, urgent, urgency}.
+  const items = msg.speak || [];
+  if (!items.length) return;
+
+  const anyUrgent = items.some((i) => i.urgent);
+  // Stay calm for normal announcements: don't pile up while already speaking.
+  if (!anyUrgent && (speechSynthesis.speaking || speechSynthesis.pending)) return;
+  // Very-close warnings interrupt whatever is playing so they land in time.
+  if (anyUrgent) speechSynthesis.cancel();
+
+  setStatus((anyUrgent ? "⚠️ " : "🔊 ") + items.map((i) => i.text).join(", "));
+  for (const it of items) {
+    const u = new SpeechSynthesisUtterance(it.text);
+    u.rate = it.rate || 1.0;   // 1.3 for very-close so it sounds urgent
+    speechSynthesis.speak(u);
+  }
+}
+
+// Urgency -> bounding-box color (green far, yellow near, red very close).
+const URGENCY_COLORS = { far: "#00e676", near: "#ffea00", "very close": "#ff1744" };
+
+function drawBoxes(boxes) {
+  // Match overlay pixel size to displayed video, then scale detection coords
+  // (which are in the downscaled frame's space) up to display space.
+  overlay.width  = video.clientWidth;
+  overlay.height = video.clientHeight;
+  const sx = overlay.width  / lastFrame.fw;
+  const sy = overlay.height / lastFrame.fh;
+
+  octx.clearRect(0, 0, overlay.width, overlay.height);
+  octx.font = "16px system-ui, sans-serif";
+  octx.textBaseline = "bottom";
+
+  for (const b of boxes) {
+    const [x1, y1, x2, y2] = b.box;
+    const x = x1 * sx, y = y1 * sy, w = (x2 - x1) * sx, h = (y2 - y1) * sy;
+    const color = URGENCY_COLORS[b.urgency] || "#00e676";
+    octx.lineWidth = b.urgency === "very close" ? 5 : 3;  // thicker = more urgent
+    octx.strokeStyle = color;
+    octx.strokeRect(x, y, w, h);
+    const label = `${b.label} ${(b.confidence * 100) | 0}%`;
+    octx.fillStyle = color;
+    const tw = octx.measureText(label).width + 8;
+    octx.fillRect(x, Math.max(0, y - 20), tw, 20);
+    octx.fillStyle = "#000";
+    octx.fillText(label, x + 4, Math.max(18, y - 2));
+  }
+}
+
+// --- Read mode (one-shot) ---------------------------------------------------
+async function doRead() {
+  if (!video.videoWidth) { setStatus("Camera not ready."); return; }
+  buttons.read.setAttribute("aria-pressed", "true");   // show busy, don't latch
+  setStatus("Read: capturing…");
+  speak("Reading", { interrupt: true });
+
+  // Capture at full resolution for the best OCR quality.
+  const cap = document.createElement("canvas");
+  cap.width = video.videoWidth;
+  cap.height = video.videoHeight;
+  cap.getContext("2d").drawImage(video, 0, 0);
+
+  const blob = await new Promise((res) => cap.toBlob(res, "image/jpeg", 0.92));
+  const form = new FormData();
+  form.append("file", blob, "frame.jpg");
+
+  setStatus("Read: recognizing text… (first run downloads OCR models, ~30s)");
+  try {
+    const resp = await fetch("/ocr", { method: "POST", body: form });
+    const data = await resp.json();              // {text, lang}
+    const text = (data.text || "").trim();
+    const lang = data.lang || "en";
+    lastResult = { text, lang };                 // remembered for Repeat
+    setStatus((lang === "ne" ? "📖 (ने) " : "📖 ") + text);
+    await speakResult(text, lang);               // Nepali -> /tts MP3, English -> Web Speech
+  } catch (err) {
+    setStatus("Read failed: " + err);
+    speak("Read failed", { interrupt: true });
+  } finally {
+    buttons.read.setAttribute("aria-pressed", "false");
+  }
+}
+
+// --- Describe mode (one-shot) -----------------------------------------------
+// Captures one frame, POSTs to /describe (Gemini vision on the backend), and
+// speaks the scene description.
+async function describeScene() {
+  if (!video.videoWidth) { setStatus("Camera not ready."); return; }
+  buttons.describe.setAttribute("aria-pressed", "true");   // show busy, don't latch
+  setStatus("Describe: looking…");
+  speak("Describing", { interrupt: true });
+
+  const cap = document.createElement("canvas");
+  cap.width = video.videoWidth;
+  cap.height = video.videoHeight;
+  cap.getContext("2d").drawImage(video, 0, 0);
+
+  const blob = await new Promise((res) => cap.toBlob(res, "image/jpeg", 0.9));
+  const form = new FormData();
+  form.append("file", blob, "frame.jpg");
+
+  try {
+    const resp = await fetch("/describe", { method: "POST", body: form });
+    const text = (await resp.text()).trim();
+    setStatus("🗺️ " + text);
+    speak(text, { interrupt: true });
+  } catch (err) {
+    setStatus("Describe failed: " + err);
+    speak("Describe failed", { interrupt: true });
+  } finally {
+    buttons.describe.setAttribute("aria-pressed", "false");
+  }
+}
+
+// --- Repeat (re-speak last OCR result, no re-capture) -----------------------
+function repeatLast() {
+  if (!lastResult || !lastResult.text) {
+    setStatus("Nothing to repeat yet — use Read first.");
+    speak("Nothing to repeat yet", { interrupt: true });
+    return;
+  }
+  setStatus((lastResult.lang === "ne" ? "🔁 (ने) " : "🔁 ") + lastResult.text);
+  speakResult(lastResult.text, lastResult.lang);
+}
+
+// --- Wire up ----------------------------------------------------------------
+buttons.navigate.addEventListener("click", () => setMode("navigate"));
+buttons.read.addEventListener("click",     () => setMode("read"));
+buttons.describe.addEventListener("click", () => setMode("describe"));
+btnRepeat.addEventListener("click", repeatLast);   // action, not a mode
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "1") setMode("navigate");
+  else if (e.key === "2") setMode("read");
+  else if (e.key === "3") setMode("describe");
+  else if (e.key === "4" || e.key.toLowerCase() === "r") repeatLast();
+});
+
+// --- Camera startup ---------------------------------------------------------
+navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false })
+  .then((stream) => {
+    video.srcObject = stream;
+    video.onloadedmetadata = () => setStatus("Ready. Press 1 to Navigate, 2 to Read, 3 to Describe.");
+  })
+  .catch((err) => setStatus("Camera error: " + err.message + " (allow camera access and reload)"));
+</script>
+</body>
+</html>

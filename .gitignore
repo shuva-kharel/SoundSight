@@ -1,0 +1,14 @@
+# Secrets -- NEVER commit your real API keys
+.env
+
+# Local HTTPS cert (regenerated automatically)
+cert.pem
+key.pem
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Model weights downloaded at runtime
+*.pt
