@@ -1,18 +1,31 @@
 """
 vision_core.py  --  Pure AI / vision logic for SoundSight.
 
-This module is intentionally hardware-agnostic and contains NO web code, so it
-ports to a Raspberry Pi (or any other host) unchanged. It only knows how to:
-  * load a YOLO model and run object detection on a BGR frame,
-  * turn a detection's horizontal position into a spoken zone,
-  * decide *what* to announce (priority + anti-repeat cooldown).
+Hardware-agnostic and contains NO web code, so it ports to a Raspberry Pi
+unchanged. The web layer (server.py) only does transport.
 
-The web layer (server.py) is responsible for transport (WebSocket / HTTP),
-frame decoding, and anything browser-specific.
+The whole detection pipeline lives behind VisionCore.detect_and_rank(frame):
+    model inference -> allowlist + part removal -> per-class confidence ->
+    part-containment suppression -> temporal smoothing -> priority ranking.
+server.py calls VisionCore.detect() (an alias) for the boxes and
+select_announcements() for the speech, so server.py never has to change.
+
+------------------------------------------------------------------------------
+HOW TO TUNE
+------------------------------------------------------------------------------
+* Switch detectors:    set MODEL_MODE below to "coco" | "openvocab" | "oiv7".
+* Change WHAT is seen:  edit NAVIGATION_CLASSES (whole objects worth announcing)
+                        and OPENVOCAB_CLASSES (the YOLO-World prompt vocabulary).
+* Hide body parts:      add class names to PART_CLASSES.
+* Tighten/loosen:       edit CONF_THRESHOLDS (per-class confidence floors).
+* See what's happening: detection logs (raw vs kept + why things were dropped)
+                        print ~once a second to the console.
 """
 
 import logging
 import os
+import time
+from collections import deque
 
 import cv2
 import numpy as np
@@ -24,15 +37,11 @@ log = logging.getLogger("soundsight.vision")
 # Pick the best available device once, at import time, and announce it.
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Frame width used by the zone logic below. Frames arriving from the browser are
-# downscaled to 416px wide, so this is the *actual* frame width. detect() keeps
-# it in sync with whatever frame it is actually handed (see detect()).
+# Frame width used by the zone logic. detect_and_rank() keeps it in sync with the
+# actual frame it processes.
 FRAME_W = 416
 
 
-# --------------------------------------------------------------------------- #
-# Announcement logic  --  EXACT behavior, do not change.
-# --------------------------------------------------------------------------- #
 def zone_for(cx):
     if cx < FRAME_W / 3:
         return "on your left"
@@ -41,56 +50,103 @@ def zone_for(cx):
     return "ahead"
 
 
-# How long to stay quiet about the same object+zone once it's been announced.
-# A constant scene (e.g. "person ahead") is spoken once, then not repeated until
-# this many seconds pass -- so it doesn't chant "careful, careful, ...".
-ANNOUNCE_COOLDOWN = 6.0
+# =========================================================================== #
+# DETECTION CONFIG
+# =========================================================================== #
+# "coco"     -> yolo11s.pt (YOLO11, 80 COCO classes). Default: fast, accurate,
+#               and almost every COCO class is navigation-relevant.
+# "openvocab"-> YOLO-World (yolov8s-worldv2.pt) restricted to OPENVOCAB_CLASSES.
+#               Best fit (only ever detects what a blind user needs); falls back
+#               to "coco" automatically if the weights/deps aren't available.
+# "oiv7"     -> yolov8s-oiv7.pt (~600 classes) leaning hard on the allowlist +
+#               part suppression below to stay sane.
+MODEL_MODE = "coco"
 
+IMG_SIZE = 640        # inference resolution
+PREDICT_CONF = 0.35   # low model floor; real cutoffs are the per-class thresholds below
 
-class Announcer:
-    """Announce each object+zone once, then stay quiet.
+# Open-vocabulary prompt for "openvocab" mode -- exactly the things a blind user
+# needs to walk around. Edit freely; YOLO-World detects whatever you list.
+OPENVOCAB_CLASSES = [
+    "person", "bicycle", "car", "motorcycle", "bus", "truck", "door", "stairs",
+    "chair", "table", "sofa", "bed", "pole", "wall", "fence", "dog", "cat",
+    "traffic light", "stop sign", "bench", "backpack", "bottle", "cup", "laptop",
+    "tv", "refrigerator", "sink", "toilet", "potted plant", "curb", "pothole",
+    "obstacle",
+]
 
-    It re-speaks the same object+zone only when EITHER (a) it becomes more urgent
-    than last time (escalation -- e.g. it just got "very close"), so genuine
-    danger is never silenced, OR (b) the refresh cooldown elapses, as a gentle
-    reminder. New objects or objects in a new zone are announced right away.
-    """
+# Whole objects worth announcing (canonical, lowercase). ANY detection whose
+# (synonym-mapped) class isn't in here is dropped, in every mode.
+NAVIGATION_CLASSES = {
+    "person", "bicycle", "car", "motorcycle", "bus", "truck", "door", "stairs",
+    "chair", "table", "couch", "bed", "pole", "wall", "fence", "dog", "cat",
+    "traffic light", "stop sign", "bench", "backpack", "bottle", "cup", "laptop",
+    "tv", "refrigerator", "sink", "toilet", "plant", "curb", "pothole", "obstacle",
+}
 
-    def __init__(self, cooldown=ANNOUNCE_COOLDOWN):
-        self.cooldown = cooldown
-        self.last = {}  # (label, zone) -> (last_time, last_urgency_rank)
+# Map model-specific / synonymous labels (lowercased) -> one spoken word.
+SYNONYMS = {
+    "sofa": "couch",
+    "dining table": "table",
+    "potted plant": "plant",
+    "houseplant": "plant",
+    "television": "tv",
+    "coffee cup": "cup",
+    "mug": "cup",
+    # Open Images labels people as Man/Woman/Boy/Girl -- an assistive tool
+    # shouldn't announce a model's (often wrong) guess at gender.
+    "man": "person", "woman": "person", "boy": "person", "girl": "person",
+}
 
-    def consider(self, label, zone, now, urgency_rank=0):
-        key = (label, zone)
-        last_time, last_rank = self.last.get(key, (-1e9, -1))
-        escalated = urgency_rank > last_rank
-        if escalated or (now - last_time) >= self.cooldown:
-            self.last[key] = (now, urgency_rank)
-            return f"{label} {zone}"
-        return None
+# Parts / worn items / attributes -- ALWAYS discarded (this is the "glasses,
+# sunglasses, human face, footwear..." spam the OIV7 model produced).
+PART_CLASSES = {
+    "glasses", "sunglasses", "goggles", "human face", "human head", "human hair",
+    "human hand", "human arm", "human leg", "human nose", "human eye", "human ear",
+    "human mouth", "clothing", "footwear", "hat", "sock", "sleeve", "human body",
+}
+
+# Worn/held items: if mostly inside a (larger) person box they're being carried,
+# not obstacles -- suppressed by part-containment below.
+CONTAINMENT_SUPPRESS_CLASSES = {"backpack", "bottle", "cup", "laptop"}
+
+# Per-class confidence floors (canonical class -> threshold). Anything below its
+# class's floor is dropped; unlisted classes use DEFAULT_CONF.
+DEFAULT_CONF = 0.55  # small / ambiguous (bottle, cup, laptop, backpack, plant, signs, dog/cat)
+CONF_THRESHOLDS = {
+    "person": 0.40,
+    # vehicles
+    "car": 0.45, "bus": 0.45, "truck": 0.45, "motorcycle": 0.45, "bicycle": 0.45,
+    # furniture / fixtures
+    "chair": 0.45, "table": 0.45, "couch": 0.45, "bed": 0.45, "bench": 0.45,
+    "sink": 0.45, "toilet": 0.45, "refrigerator": 0.45, "tv": 0.45,
+    # structure / hazards
+    "stairs": 0.50, "door": 0.50, "pole": 0.50, "obstacle": 0.50,
+    "wall": 0.50, "fence": 0.50, "curb": 0.50, "pothole": 0.50,
+}
+
+# Importance for ranking what to *announce* (higher = more important).
+DEFAULT_IMPORTANCE = 1
+IMPORTANCE = {
+    "person": 3, "car": 3, "bus": 3, "truck": 3, "motorcycle": 3, "bicycle": 3,
+    "stairs": 3, "pole": 3, "curb": 3, "pothole": 3, "obstacle": 3,
+    "door": 2, "wall": 2, "fence": 2, "bench": 2, "dog": 2, "cat": 2,
+    "traffic light": 2, "stop sign": 2,
+}
 
 
 # --------------------------------------------------------------------------- #
 # Proximity / urgency
 # --------------------------------------------------------------------------- #
-# Closeness is estimated from how much of the frame an object's box fills:
-#     area_ratio = box_area / frame_area
-FAR_MAX = 0.05          # area_ratio < 0.05            -> "far"
-NEAR_MAX = 0.20         # 0.05 <= area_ratio <= 0.20   -> "near"
-                        # area_ratio > 0.20            -> "very close"
-
+FAR_MAX = 0.05          # area_ratio < 0.05          -> "far"
+NEAR_MAX = 0.20         # 0.05 <= area_ratio <= 0.20 -> "near"
+                        # area_ratio > 0.20          -> "very close"
 URGENCY_FAR = "far"
 URGENCY_NEAR = "near"
 URGENCY_VERY_CLOSE = "very close"
-
-# Speaking priority is urgency-first (a very-close hazard outranks a distant
-# person), then people, then bounding-box area. This keeps the closest danger
-# from being dropped by the per-frame cap.
 URGENCY_RANK = {URGENCY_FAR: 0, URGENCY_NEAR: 1, URGENCY_VERY_CLOSE: 2}
 
-# How much area_ratio must grow vs. the previous frame to count as "approaching"
-# (a small margin so box jitter doesn't trigger false alarms).
-APPROACH_MARGIN = 0.01
+APPROACH_MARGIN = 0.01  # area_ratio growth needed to count as "approaching"
 
 
 def classify_urgency(area_ratio):
@@ -101,168 +157,268 @@ def classify_urgency(area_ratio):
     return URGENCY_FAR
 
 
-class ApproachDetector:
-    """
-    Flags objects that are getting closer, one instance per connection.
+def _area(box_or_det):
+    box = box_or_det["box"] if isinstance(box_or_det, dict) else box_or_det
+    x1, y1, x2, y2 = box
+    return (x2 - x1) * (y2 - y1)
 
-    Right now "closer" is inferred purely from vision: an object's area_ratio
-    growing frame-over-frame. On the Raspberry Pi you can REPLACE the body of
-    approaching_objects() with real ultrasonic-sensor readings -- keep the same
-    signature (detections in, a set of (label, zone) keys out) and nothing else
-    in the pipeline has to change.
+
+def _ios(inner, outer):
+    """Intersection over `inner`'s own area: how much of `inner` sits inside `outer`."""
+    ix1, iy1 = max(inner[0], outer[0]), max(inner[1], outer[1])
+    ix2, iy2 = min(inner[2], outer[2]), min(inner[3], outer[3])
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    a = (inner[2] - inner[0]) * (inner[3] - inner[1])
+    return inter / a if a > 0 else 0.0
+
+
+def conf_threshold(canonical):
+    return CONF_THRESHOLDS.get(canonical, DEFAULT_CONF)
+
+
+def importance_of(canonical):
+    return IMPORTANCE.get(canonical, DEFAULT_IMPORTANCE)
+
+
+# --------------------------------------------------------------------------- #
+# Announcement timing
+# --------------------------------------------------------------------------- #
+ANNOUNCE_COOLDOWN = 2.5    # don't repeat the same object+zone within this window
+VERY_CLOSE_COOLDOWN = 1.0  # ...but very-close hazards re-warn this often
+
+
+class Announcer:
+    """Prevents repeating the same object+zone within `cooldown` seconds."""
+
+    def __init__(self, cooldown=ANNOUNCE_COOLDOWN):
+        self.cooldown = cooldown
+        self.last = {}
+
+    def consider(self, label, zone, now, cooldown=None):
+        # cooldown=None -> the normal 2.5s; very-close warnings pass 1.0s.
+        cd = self.cooldown if cooldown is None else cooldown
+        key = (label, zone)
+        if now - self.last.get(key, -999) >= cd:
+            self.last[key] = now
+            return f"{label} {zone}"
+        return None
+
+
+class ApproachDetector:
+    """Flags objects getting closer (area_ratio growing), one per connection.
+
+    PI PORT: replace approaching_objects() with ultrasonic distance deltas --
+    keep the signature (detections in, set of (label, zone) keys out).
     """
 
     def __init__(self, margin=APPROACH_MARGIN):
         self.margin = margin
-        self.prev = {}  # (label, zone) -> largest area_ratio seen last frame
+        self.prev = {}
 
     def approaching_objects(self, detections):
-        """Return the set of (label, zone) keys whose area_ratio grew this frame.
-
-        PI PORT: swap this body for ultrasonic distance deltas -- return the set
-        of object keys the sensor reports are getting closer.
-        """
         current = {}
         for det in detections:
             key = (det["label"], zone_for(det["cx"]))
             current[key] = max(current.get(key, 0.0), det["area_ratio"])
-
         approaching = {
-            key
-            for key, ratio in current.items()
+            key for key, ratio in current.items()
             if key in self.prev and ratio > self.prev[key] + self.margin
         }
         self.prev = current
         return approaching
 
 
-# --------------------------------------------------------------------------- #
-# Detection
-# --------------------------------------------------------------------------- #
-# Default model: Open Images V7 (~600 classes) so Read/Navigate know everyday
-# objects -- pen, mobile phone, headphones, book, laptop, mouse, cup, bottle...
-# Swap to "yolo11n.pt" for the lighter 80-class COCO model (faster, fewer types),
-# or a YOLO-World model if you want to set your own open-vocabulary class list.
-DETECT_MODEL = "yolov8s-oiv7.pt"
-CONF_THRESHOLD = 0.45
-IMG_SIZE = 640  # 600-class model + small objects (pens, earbuds) need the resolution
+class TemporalTracker:
+    """Confirms objects across frames to kill single-frame flickers/ghosts.
+
+    An object (keyed by class + approximate zone) is "confirmed" only after it
+    appears in at least `confirm` of the last `window` frames, and is forgotten
+    after `forget` consecutive missing frames.
+    """
+
+    def __init__(self, confirm=3, window=5, forget=5):
+        self.confirm, self.window, self.forget = confirm, window, forget
+        self.frame = 0
+        self.seen = {}  # key -> deque of frame indices it was seen in
+
+    def update(self, keys_this_frame):
+        self.frame += 1
+        f = self.frame
+        for k in keys_this_frame:
+            dq = self.seen.setdefault(k, deque(maxlen=self.window))
+            if not dq or dq[-1] != f:
+                dq.append(f)
+
+        confirmed = set()
+        for k, dq in list(self.seen.items()):
+            if sum(1 for i in dq if i > f - self.window) >= self.confirm:
+                confirmed.add(k)
+            if dq and (f - dq[-1]) >= self.forget:
+                del self.seen[k]
+        return confirmed
 
 
+# --------------------------------------------------------------------------- #
+# Detection pipeline
+# --------------------------------------------------------------------------- #
 class VisionCore:
-    """Loads YOLO once and runs detection. Reusable on Pi or server."""
+    """Loads a detector once and runs the full clean/stable pipeline.
 
-    def __init__(self, model_path=DETECT_MODEL):
-        # Auto-downloads the weights on first run.
-        self.model = YOLO(model_path)
+    NOTE: the TemporalTracker state lives here, which assumes a single live
+    Navigate client (true for this prototype). For multiple simultaneous clients
+    you'd give each connection its own tracker.
+    """
+
+    def __init__(self, mode=MODEL_MODE):
+        self.mode = mode
+        self.model = self._load_model()
         self.names = self.model.names
+        self.tracker = TemporalTracker()
+        self._last_log = 0.0
         log.info(
-            "YOLO model '%s' (%d classes) loaded on device: %s",
-            model_path, len(self.names), DEVICE.upper(),
+            "Detection: mode=%s, %d model classes, device=%s",
+            self.mode, len(self.names), DEVICE.upper(),
         )
         if DEVICE == "cpu":
             log.warning("Running on CPU -- detection will be slower.")
 
-    def detect(self, frame_bgr):
-        """
-        Run object detection on a single BGR frame.
+    def _load_model(self):
+        if self.mode == "openvocab":
+            try:
+                from ultralytics import YOLOWorld
 
-        Returns a list of dicts:
-            {label, confidence, cx, cy, box[x1, y1, x2, y2], area_ratio, urgency}
-        with confidence < CONF_THRESHOLD already filtered out.
+                m = YOLOWorld("yolov8s-worldv2.pt")
+                m.set_classes(OPENVOCAB_CLASSES)
+                log.info("Loaded YOLO-World with %d navigation classes", len(OPENVOCAB_CLASSES))
+                return m
+            except Exception as exc:
+                log.warning("openvocab unavailable (%s) -- falling back to coco", exc)
+                self.mode = "coco"
+                return YOLO("yolo11s.pt")
+        if self.mode == "oiv7":
+            return YOLO("yolov8s-oiv7.pt")
+        if self.mode != "coco":
+            log.warning("Unknown MODEL_MODE '%s' -- using coco", self.mode)
+            self.mode = "coco"
+        return YOLO("yolo11s.pt")  # auto-downloads on first run
+
+    def detect_and_rank(self, frame_bgr):
+        """Full pipeline -> confirmed, navigation-relevant detections, ranked by
+        priority. Each dict: {label, confidence, cx, cy, box, area_ratio, urgency}
+        with `label` already grouped to its canonical spoken word.
         """
-        # Keep the global frame width (used by zone_for) honest about the frame
-        # we are actually processing.
         global FRAME_W
         frame_h, frame_w = frame_bgr.shape[:2]
         FRAME_W = frame_w
         frame_area = float(frame_w * frame_h)
 
         results = self.model.predict(
-            frame_bgr,
-            imgsz=IMG_SIZE,
-            conf=CONF_THRESHOLD,
-            device=DEVICE,
-            verbose=False,
+            frame_bgr, imgsz=IMG_SIZE, conf=PREDICT_CONF, device=DEVICE, verbose=False
         )[0]
 
-        detections = []
+        raw_count = len(results.boxes)
+        dropped = {}  # reason -> count, for tuning logs
+
+        # --- Stage 1: allowlist + part blocklist + per-class confidence -------
+        kept = []
         for box in results.boxes:
-            confidence = float(box.conf[0])
-            if confidence < CONF_THRESHOLD:  # belt-and-suspenders
+            low = self.names[int(box.cls[0])].lower()
+            if low in PART_CLASSES:
+                dropped["part"] = dropped.get("part", 0) + 1
+                continue
+            canonical = SYNONYMS.get(low, low)
+            if canonical not in NAVIGATION_CLASSES:
+                dropped["not-navigation"] = dropped.get("not-navigation", 0) + 1
+                continue
+            conf = float(box.conf[0])
+            if conf < conf_threshold(canonical):
+                dropped["low-confidence"] = dropped.get("low-confidence", 0) + 1
                 continue
             x1, y1, x2, y2 = (float(v) for v in box.xyxy[0])
-            label = self.names[int(box.cls[0])]
             area_ratio = ((x2 - x1) * (y2 - y1) / frame_area) if frame_area else 0.0
-            detections.append(
-                {
-                    "label": label,
-                    "confidence": round(confidence, 3),
-                    "cx": (x1 + x2) / 2,
-                    "cy": (y1 + y2) / 2,
-                    "box": [x1, y1, x2, y2],
-                    "area_ratio": round(area_ratio, 4),
-                    "urgency": classify_urgency(area_ratio),
-                }
-            )
-        return detections
+            kept.append({
+                "label": canonical,
+                "confidence": round(conf, 3),
+                "cx": (x1 + x2) / 2, "cy": (y1 + y2) / 2,
+                "box": [x1, y1, x2, y2],
+                "area_ratio": round(area_ratio, 4),
+                "urgency": classify_urgency(area_ratio),
+            })
+
+        # --- Stage 2: part-containment suppression (worn/held inside a person) -
+        persons = [k for k in kept if k["label"] == "person"]
+        survivors = []
+        for k in kept:
+            if k["label"] in CONTAINMENT_SUPPRESS_CLASSES and any(
+                _area(p) > _area(k) and _ios(k["box"], p["box"]) > 0.6 for p in persons
+            ):
+                dropped["worn-on-person"] = dropped.get("worn-on-person", 0) + 1
+                continue
+            survivors.append(k)
+
+        # --- Stage 3: temporal smoothing (confirm 3-of-5, forget after 5) ------
+        keys = {(k["label"], zone_for(k["cx"])) for k in survivors}
+        confirmed_keys = self.tracker.update(keys)
+        confirmed = [k for k in survivors if (k["label"], zone_for(k["cx"])) in confirmed_keys]
+        if len(survivors) - len(confirmed):
+            dropped["unconfirmed"] = len(survivors) - len(confirmed)
+
+        # --- Stage 4: rank for announcing (closeness, then importance, then size)
+        confirmed.sort(
+            key=lambda d: (URGENCY_RANK[d["urgency"]], importance_of(d["label"]), _area(d)),
+            reverse=True,
+        )
+
+        self._log(raw_count, len(confirmed), dropped)
+        return confirmed
+
+    # Back-compat alias so server.py (boxes from vision.detect) is unchanged.
+    def detect(self, frame_bgr):
+        return self.detect_and_rank(frame_bgr)
+
+    def _log(self, raw, kept, dropped):
+        # Throttle to ~1/sec so the console stays readable while still tunable.
+        now = time.time()
+        if now - self._last_log < 1.0:
+            return
+        self._last_log = now
+        reasons = ", ".join(f"{r} x{c}" for r, c in dropped.items() if c) or "none"
+        log.info("[%s] raw=%d kept=%d | dropped: %s", self.mode, raw, kept, reasons)
 
 
 # --------------------------------------------------------------------------- #
-# What to speak  --  priority + cap, kept here so the Pi port speaks the same.
+# What to speak  --  rate-limit + cap, on the already-ranked confirmed list.
 # --------------------------------------------------------------------------- #
-def _area(det):
-    x1, y1, x2, y2 = det["box"]
-    return (x2 - x1) * (y2 - y1)
-
-
-# Open Images labels people as Man/Woman/Boy/Girl/etc. We treat them all as
-# "person": it keeps the people-first priority working, and an assistive tool
-# shouldn't announce a model's (often wrong) guess at someone's gender.
-PERSON_LABELS = {"person", "man", "woman", "boy", "girl", "human", "human body", "human face"}
-
-
-def _is_person(label):
-    return label.lower() in PERSON_LABELS
-
-
 def select_announcements(detections, announcer, approaching, now, max_items=2):
     """
-    Given this frame's detections, decide what to say.
+    `detections` is already confirmed + priority-ranked by detect_and_rank().
+    Apply the per-object+zone cooldown (very-close bypasses to 1s), phrase it,
+    and cap at `max_items` so it stays calm.
 
-    Priority: urgency first (very close > near > far), then people, then largest
-    objects by bounding-box area -- so the closest hazard is never crowded out by
-    the per-frame cap. Caps at `max_items` spoken items per frame so it stays calm.
+    Phrasing:
+      * very close -> "Careful, {name} {zone}, very close" (rate 1.3, urgent)
+      * approaching -> "{name} {zone}, getting closer"
+      * otherwise  -> "{name} {zone}"
 
-    Phrasing (the Announcer decides *whether* to speak, see ANNOUNCE_COOLDOWN):
-      * very close -> "Careful, {label} {zone}, very close" (rate 1.3, urgent)
-      * approaching -> "{label} {zone}, getting closer"
-      * otherwise  -> "{label} {zone}"
-
-    `approaching` is the set of (label, zone) keys from ApproachDetector.
-
-    Returns a list of dicts: {text, rate, urgent, urgency} so the browser can
-    speak very-close warnings faster (rate 1.3) and interrupt for them.
+    Never emits a generic "something detected": every confirmed object already
+    has a real spoken name (its canonical class), but we guard anyway.
     """
-    ordered = sorted(
-        detections,
-        key=lambda d: (URGENCY_RANK[d["urgency"]], _is_person(d["label"]), _area(d)),
-        reverse=True,
-    )
-
     spoken = []
-    for det in ordered:
+    for det in detections:
+        name = det["label"]
+        if not name:  # no spoken name -> stay silent
+            continue
         zone = zone_for(det["cx"])
         urgency = det["urgency"]
-        # Escalation (urgency went up) speaks immediately; otherwise the Announcer
-        # keeps a constant scene quiet until the refresh cooldown elapses.
-        if announcer.consider(det["label"], zone, now, urgency_rank=URGENCY_RANK[urgency]) is None:
+        very_close = urgency == URGENCY_VERY_CLOSE
+
+        cooldown = VERY_CLOSE_COOLDOWN if very_close else None  # None -> 2.5s
+        if announcer.consider(name, zone, now, cooldown=cooldown) is None:
             continue
 
-        # Title-Case Open Images labels -> plain lowercase; people -> "person".
-        name = "person" if _is_person(det["label"]) else det["label"].lower()
-        if urgency == URGENCY_VERY_CLOSE:
+        if very_close:
             text, rate, urgent = f"Careful, {name} {zone}, very close", 1.3, True
-        elif (det["label"], zone) in approaching:
+        elif (name, zone) in approaching:
             text, rate, urgent = f"{name} {zone}, getting closer", 1.0, False
         else:
             text, rate, urgent = f"{name} {zone}", 1.0, False
@@ -279,8 +435,7 @@ def select_announcements(detections, announcer, approaching, now, max_items=2):
 # A vision-language model turns one frame into a short spoken description. This
 # is the only part that calls an external AI service (Google Gemini). It is
 # isolated behind SceneDescriber.describe() so you can swap providers -- a local
-# VLM, Anthropic, etc. -- WITHOUT touching server.py or the browser. It ports to
-# the Pi unchanged (the Pi can call the same cloud API).
+# VLM, Anthropic, etc. -- WITHOUT touching server.py or the browser.
 DESCRIBE_MODEL = "gemini-2.5-flash"  # richer: "gemini-3.5-flash"
 DESCRIBE_PROMPT = (
     "You are the eyes of a blind person wearing this camera. In one or two short, "

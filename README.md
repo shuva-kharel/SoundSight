@@ -16,19 +16,38 @@ browser ──(downscaled JPEG frames)──►  server.py  ──►  vision_co
 
 ## Modes
 - **Navigate** — streams frames, draws bounding boxes, and speaks e.g.
-  `"person ahead"`, `"chair on your left"`. It stays calm: max 2 items/frame, and
-  each object+zone is announced **once**, then not repeated for `ANNOUNCE_COOLDOWN`
-  seconds (default 6) — **unless** it gets more urgent (e.g. goes "very close"),
-  which speaks immediately. New objects / new zones are announced right away.
+  `"person ahead"`, `"chair on your left"`. It stays calm: max 2 items/frame, each
+  object+zone is announced at most once per **2.5s** cooldown, and **very-close**
+  hazards (`area_ratio > 0.20`) bypass that to re-warn every **1s**.
 
-### Objects it can detect
-Uses **Open Images V7** (`yolov8s-oiv7.pt`, ~600 classes) so it knows everyday
-items: person, **pen**, **mobile phone**, **headphones**, **book**, laptop,
-computer mouse/keyboard, cup, bottle, backpack, scissors, watch, and many more.
-Set `DETECT_MODEL` in [`vision_core.py`](vision_core.py) to `"yolo11n.pt"` for the
-lighter 80-class COCO model, or a YOLO-World model to pick your own class list.
-Note: tiny/distant objects (a pen across the room, earbuds) are hard for any
-model — hold them up to the camera for best results.
+### Detection pipeline (navigation-focused, anti-spam)
+The whole pipeline lives behind `VisionCore.detect_and_rank()` in
+[`vision_core.py`](vision_core.py) and is built to be *clean and stable* rather
+than detect-everything:
+1. **Model** — set by `MODEL_MODE` (top of the file):
+   - `"coco"` *(default)* — `yolo11s.pt`, 80 COCO classes; fast, accurate, and
+     almost all nav-relevant.
+   - `"openvocab"` — YOLO-World restricted to `OPENVOCAB_CLASSES` (best fit; only
+     detects what a blind user needs). First use auto-installs CLIP via
+     ultralytics — you may need to restart the server once.
+   - `"oiv7"` — `yolov8s-oiv7.pt` (~600 classes) behind the same filters.
+2. **Allowlist** — only `NAVIGATION_CLASSES` (person, vehicles, doors, stairs,
+   furniture, poles…) survive; everything else is dropped, and synonyms are
+   grouped to one spoken word (`sofa→couch`, `dining table→table`).
+3. **Part removal** — `PART_CLASSES` (glasses, human face/hand/arm, footwear,
+   clothing…) are always discarded, plus worn/held items mostly inside a person
+   box are suppressed.
+4. **Per-class confidence** — `CONF_THRESHOLDS` (person 0.40, vehicles/furniture
+   0.45, structure 0.50, small/ambiguous 0.55).
+5. **Temporal smoothing** — an object is only announced after it's seen in **3 of
+   the last 5 frames**, killing single-frame flickers/ghosts.
+6. **Ranking** — by closeness, then importance (person/vehicles/stairs/poles
+   highest), capped at 2 spoken items.
+
+The console logs `raw=… kept=… dropped: …` (~once/second) so you can tune
+thresholds. To detect non-navigation items again (e.g. **pen**, **headphones**),
+add them to `NAVIGATION_CLASSES` and use `"oiv7"` or `"openvocab"` mode — the
+default is deliberately navigation-only.
 - **Read** — captures one full-res frame, runs **bilingual OCR (Nepali +
   English)** via `POST /ocr` (returns `{text, lang}`), and speaks it. English is
   spoken with the browser's Web Speech API; **Nepali** (Devanagari) is sent to
@@ -38,6 +57,10 @@ model — hold them up to the camera for best results.
   TTS (espeak-ng / Piper / Coqui), same contract.
 - **Repeat** (key **4** or **R**) — re-speaks the last Read result without
   re-capturing (handy if you missed it or want it slower to follow).
+- **Language** (key **5** or **L**) — cycles **Auto → English → नेपाली**. Auto
+  trusts the OCR's detected script; pick English or Nepali to force the voice when
+  auto-detection guesses wrong. Each press speaks a confirmation; then press
+  **Repeat** to re-hear the last text in the chosen language.
 - **Describe** — captures one frame, sends it to a vision-language model
   (Google **Gemini**) via `POST /describe`, and speaks a short scene description.
   Needs a `GEMINI_API_KEY` (see below). The provider is isolated in
@@ -114,9 +137,9 @@ second you should see boxes and hear *"person ahead"*.
 >
 > Open `localhost`, not your LAN IP.
 
-The first run downloads the detection model (`yolov8s-oiv7.pt`, ~22 MB)
-automatically. The first time you use **Read**, EasyOCR downloads its Nepali +
-English models — Navigate is unaffected.
+The first run downloads the detection model (`yolo11s.pt`, ~19 MB) automatically.
+The first time you use **Read**, EasyOCR downloads its Nepali + English models —
+Navigate is unaffected.
 
 ## Logging
 On startup the backend prints which device YOLO uses (`CUDA` or `CPU`). During

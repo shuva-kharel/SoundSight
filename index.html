@@ -46,10 +46,11 @@
     <button class="mode" id="btnRead"     aria-pressed="false" accesskey="2">Read</button>
     <button class="mode" id="btnDescribe" aria-pressed="false" accesskey="3">Describe</button>
     <button class="mode" id="btnRepeat"   accesskey="4">🔁 Repeat</button>
+    <button class="mode" id="btnLang"     accesskey="5">🌐 Lang: Auto</button>
   </div>
 
   <div id="status" role="status" aria-live="assertive">Starting camera…</div>
-  <p class="hint">Keys: 1 = Navigate, 2 = Read, 3 = Describe, 4 = Repeat. Tap a mode again to stop.</p>
+  <p class="hint">Keys: 1 = Navigate, 2 = Read, 3 = Describe, 4 = Repeat, 5 = Language. Tap a mode again to stop.</p>
 
 <script>
 "use strict";
@@ -80,8 +81,16 @@ let lastFrame = { fw: SEND_WIDTH, fh: SEND_WIDTH };
 
 let lastResult = null;       // {text, lang} from the last OCR -> used by Repeat
 let ttsAudio = null;         // <audio> currently playing a Nepali MP3
+let langMode = "auto";       // "auto" = trust OCR detection | "en" | "ne" = force it
+
+const btnLang = document.getElementById("btnLang");
 
 function setStatus(msg) { statusEl.textContent = msg; }
+
+// Resolve which voice to use: the manual Language button overrides OCR's guess.
+function effectiveLang(detected) {
+  return langMode === "auto" ? (detected || "en") : langMode;
+}
 
 // --- Speech (Web Speech API) ------------------------------------------------
 function speak(text, { interrupt = false } = {}) {
@@ -98,10 +107,11 @@ function stopTtsAudio() {
 }
 
 // Speak an OCR result in the right voice: English -> Web Speech API; Nepali ->
-// the /tts MP3 (the offline browser voice reads Devanagari poorly).
-async function speakResult(text, lang) {
+// the /tts MP3 (the offline browser voice reads Devanagari poorly). The Language
+// button (langMode) can override OCR's auto-detected language.
+async function speakResult(text, detectedLang) {
   if (!text) return;
-  if (lang === "ne") {
+  if (effectiveLang(detectedLang) === "ne") {
     await speakNepali(text);
   } else {
     stopTtsAudio();
@@ -262,7 +272,7 @@ async function doRead() {
     const text = (data.text || "").trim();
     const lang = data.lang || "en";
     lastResult = { text, lang };                 // remembered for Repeat
-    setStatus((lang === "ne" ? "📖 (ने) " : "📖 ") + text);
+    setStatus((effectiveLang(lang) === "ne" ? "📖 (ने) " : "📖 ") + text);
     await speakResult(text, lang);               // Nepali -> /tts MP3, English -> Web Speech
   } catch (err) {
     setStatus("Read failed: " + err);
@@ -310,8 +320,23 @@ function repeatLast() {
     speak("Nothing to repeat yet", { interrupt: true });
     return;
   }
-  setStatus((lastResult.lang === "ne" ? "🔁 (ने) " : "🔁 ") + lastResult.text);
+  setStatus((effectiveLang(lastResult.lang) === "ne" ? "🔁 (ने) " : "🔁 ") + lastResult.text);
   speakResult(lastResult.text, lastResult.lang);
+}
+
+// --- Language button: Auto -> English -> Nepali (re-speaks last result) ------
+const LANG_CYCLE = ["auto", "en", "ne"];
+const LANG_UI = {
+  auto: { btn: "🌐 Lang: Auto",    say: "Auto detect" },
+  en:   { btn: "🌐 Lang: English", say: "English" },
+  ne:   { btn: "🌐 Lang: नेपाली",  say: "Nepali" },
+};
+function cycleLang() {
+  langMode = LANG_CYCLE[(LANG_CYCLE.indexOf(langMode) + 1) % LANG_CYCLE.length];
+  btnLang.textContent = LANG_UI[langMode].btn;
+  const hint = (lastResult && lastResult.text) ? " — press Repeat to re-hear" : "";
+  setStatus("Language: " + LANG_UI[langMode].say + hint);
+  speak("Language " + LANG_UI[langMode].say, { interrupt: true });  // audio cue for blind users
 }
 
 // --- Wire up ----------------------------------------------------------------
@@ -319,12 +344,14 @@ buttons.navigate.addEventListener("click", () => setMode("navigate"));
 buttons.read.addEventListener("click",     () => setMode("read"));
 buttons.describe.addEventListener("click", () => setMode("describe"));
 btnRepeat.addEventListener("click", repeatLast);   // action, not a mode
+btnLang.addEventListener("click", cycleLang);
 
 document.addEventListener("keydown", (e) => {
   if (e.key === "1") setMode("navigate");
   else if (e.key === "2") setMode("read");
   else if (e.key === "3") setMode("describe");
   else if (e.key === "4" || e.key.toLowerCase() === "r") repeatLast();
+  else if (e.key === "5" || e.key.toLowerCase() === "l") cycleLang();
 });
 
 // --- Camera startup ---------------------------------------------------------
