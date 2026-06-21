@@ -8,8 +8,15 @@ websockets
 python-multipart
 cryptography    # generates the self-signed cert for HTTPS (browsers force it on localhost)
 google-genai    # Describe mode: Google Gemini vision API (needs GEMINI_API_KEY)
-gTTS            # Read mode: Nepali text-to-speech MP3 (needs internet; offline-swappable on the Pi)
+gTTS            # nicer Nepali voice for ARBITRARY OCR text + to pre-generate the fixed
+                # phrases (run `python gen_voice.py` once, online, -> audio/ne/*.mp3)
 python-dotenv   # loads GEMINI_API_KEY etc. from a .env file in the project root
+# Nepali speech is TIERED: pre-recorded audio/ne/ files (best, offline) for the fixed
+# vocabulary -> gTTS (good, online) for arbitrary text -> espeak-ng (offline fallback).
+# espeak-ng is a program, not a pip package: Windows `winget install eSpeak-NG.eSpeak-NG`,
+# Pi/Linux `sudo apt install espeak-ng`. English speech is the browser's Web Speech API.
+#
+# OPTIONAL (faces): pip install insightface onnxruntime  (best, GPU) OR  face_recognition
 # Note: MODEL_MODE="openvocab" (YOLO-World) also needs CLIP -- ultralytics
 # auto-installs it on first use, so it isn't pinned here.
 

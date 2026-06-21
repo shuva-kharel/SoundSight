@@ -31,6 +31,11 @@
     background: #111; border-radius: 8px; min-height: 1.6em;
   }
   .hint { color: #aaa; font-size: .95rem; margin-bottom: 24px; }
+  #caption {
+    font-size: 1.05rem; color: var(--accent); min-height: 1.4em;
+    max-width: 720px; margin: 4px auto; font-style: italic;
+  }
+  button.mode[aria-pressed="true"]#btnVoice { background: var(--ok); border-color: var(--ok); color:#000; }
 </style>
 </head>
 <body>
@@ -45,12 +50,15 @@
     <button class="mode" id="btnNavigate" aria-pressed="false" accesskey="1">Navigate</button>
     <button class="mode" id="btnRead"     aria-pressed="false" accesskey="2">Read</button>
     <button class="mode" id="btnDescribe" aria-pressed="false" accesskey="3">Describe</button>
-    <button class="mode" id="btnRepeat"   accesskey="4">🔁 Repeat</button>
-    <button class="mode" id="btnLang"     accesskey="5">🌐 Lang: Auto</button>
+    <button class="mode" id="btnMoney"    aria-pressed="false" accesskey="4">💵 Money</button>
+    <button class="mode" id="btnRepeat"   accesskey="5">🔁 Repeat</button>
+    <button class="mode" id="btnLang"     accesskey="6">🌐 Lang: Auto</button>
+    <button class="mode" id="btnVoice"    aria-pressed="false" accesskey="7">🎤 Voice</button>
   </div>
 
   <div id="status" role="status" aria-live="assertive">Starting camera…</div>
-  <p class="hint">Keys: 1 = Navigate, 2 = Read, 3 = Describe, 4 = Repeat, 5 = Language. Tap a mode again to stop.</p>
+  <div id="caption" aria-live="polite"></div>
+  <p class="hint">Keys: 1 Navigate · 2 Read · 3 Describe · 4 Money · 5 Repeat · 6 Language · 7 Voice · C Crossing · H Help · D Demo. Voice: say “hey sight …”.</p>
 
 <script>
 "use strict";
@@ -64,6 +72,7 @@ const buttons = {
   navigate: document.getElementById("btnNavigate"),
   read:     document.getElementById("btnRead"),
   describe: document.getElementById("btnDescribe"),
+  money:    document.getElementById("btnMoney"),
 };
 const btnRepeat = document.getElementById("btnRepeat");
 
@@ -79,8 +88,8 @@ let ws = null;
 let navTimer = null;
 let lastFrame = { fw: SEND_WIDTH, fh: SEND_WIDTH };
 
-let lastResult = null;       // {text, lang} from the last OCR -> used by Repeat
-let ttsAudio = null;         // <audio> currently playing a Nepali MP3
+let lastResult = null;       // {text, lang} from the last Read/Describe -> used by Repeat
+let ttsAudio = null;         // <audio> currently playing a Nepali clip
 let langMode = "auto";       // "auto" = trust OCR detection | "en" | "ne" = force it
 
 const btnLang = document.getElementById("btnLang");
@@ -92,50 +101,99 @@ function effectiveLang(detected) {
   return langMode === "auto" ? (detected || "en") : langMode;
 }
 
-// --- Speech (Web Speech API) ------------------------------------------------
-function speak(text, { interrupt = false } = {}) {
-  if (!text) return;
-  // Stay calm: don't pile up utterances while one is already playing,
-  // unless we explicitly want to interrupt (Read / Describe).
-  if (interrupt) speechSynthesis.cancel();
-  else if (speechSynthesis.speaking || speechSynthesis.pending) return;
-  speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+// --- Unified PRIORITY speech queue -----------------------------------------
+// Only ONE thing speaks at a time, ranked: HAZARD (very-close / crossing) >
+// ANSWER (replies to a command) > AMBIENT (background navigation). A higher
+// priority interrupts a lower one; ambient never piles up behind speech. English
+// uses the Web Speech API; Nepali uses the offline /tts WAV (cached per phrase).
+const PRI = { AMBIENT: 1, ANSWER: 2, HAZARD: 3 };
+let voiceRate = 1.0, voiceVolume = 1.0;   // adjusted by louder/softer/slower/faster
+let sayQueue = [], curPlaying = null, ttsGen = 0;
+const ttsCache = new Map();               // Nepali text -> object URL (session cache)
+
+async function ttsUrl(text) {
+  if (ttsCache.has(text)) return ttsCache.get(text);
+  const form = new FormData();
+  form.append("text", text); form.append("lang", "ne");
+  const resp = await fetch("/tts", { method: "POST", body: form });
+  if (!resp.ok) throw new Error("tts " + resp.status);
+  const url = URL.createObjectURL(await resp.blob());
+  ttsCache.set(text, url);
+  return url;
 }
 
-function stopTtsAudio() {
+function stopSpeech(clear = true) {
+  ttsGen++;                                // invalidate any in-flight play
+  try { speechSynthesis.cancel(); } catch (_) {}
   if (ttsAudio) { ttsAudio.pause(); ttsAudio = null; }
+  curPlaying = null;
+  if (clear) sayQueue = [];
 }
+const stopTtsAudio = () => stopSpeech(true);   // back-compat name (used by stopEverything)
 
-// Speak an OCR result in the right voice: English -> Web Speech API; Nepali ->
-// the /tts MP3 (the offline browser voice reads Devanagari poorly). The Language
-// button (langMode) can override OCR's auto-detected language.
-async function speakResult(text, detectedLang) {
+function say(text, { lang, priority = PRI.ANSWER, rate = 1.0 } = {}) {
   if (!text) return;
-  if (effectiveLang(detectedLang) === "ne") {
-    await speakNepali(text);
+  lang = lang || effectiveLang();
+  const item = { text, lang, priority, rate };
+  if (curPlaying) {
+    if (priority > curPlaying.priority) { stopSpeech(true); sayQueue = [item]; playNext(); return; }
+    if (priority === PRI.AMBIENT) return;  // don't pile ambient behind speech
+    sayQueue.push(item); return;
+  }
+  sayQueue.push(item); playNext();
+}
+
+function playNext() {
+  if (curPlaying) return;
+  const item = sayQueue.shift();
+  if (!item) return;
+  curPlaying = item;
+  const gen = ttsGen;
+  const done = () => { if (gen === ttsGen) { curPlaying = null; playNext(); } };
+  if (item.lang === "ne") {
+    playNepaliOnce(item.text).then(done);
   } else {
-    stopTtsAudio();
-    speak(text, { interrupt: true });
+    try {
+      const u = new SpeechSynthesisUtterance(item.text);
+      u.rate = (item.rate || 1.0) * voiceRate;
+      u.volume = voiceVolume;
+      u.onend = done; u.onerror = done;
+      speechSynthesis.speak(u);
+    } catch (_) { done(); }
   }
 }
 
-async function speakNepali(text) {
-  speechSynthesis.cancel();   // silence any English voice
-  stopTtsAudio();
+async function playNepaliOnce(text) {
   try {
-    const form = new FormData();
-    form.append("text", text);
-    form.append("lang", "ne");
-    const resp = await fetch("/tts", { method: "POST", body: form });
-    if (!resp.ok) throw new Error("tts " + resp.status);
-    const url = URL.createObjectURL(await resp.blob());
-    ttsAudio = new Audio(url);
-    ttsAudio.addEventListener("ended", () => URL.revokeObjectURL(url));
-    await ttsAudio.play();
-  } catch (err) {
-    // gTTS needs internet; if it fails, fall back to the browser voice.
-    speak(text, { interrupt: true });
+    const url = await ttsUrl(text);
+    await new Promise((res) => {
+      ttsAudio = new Audio(url); ttsAudio.volume = voiceVolume;
+      ttsAudio.onended = res; ttsAudio.onerror = res;
+      ttsAudio.play().catch(res);
+    });
+  } catch (_) {   // espeak-ng/offline -> fall back to the browser voice
+    await new Promise((res) => {
+      const u = new SpeechSynthesisUtterance(text); u.volume = voiceVolume;
+      u.onend = res; u.onerror = res;
+      try { speechSynthesis.speak(u); } catch (_) { res(); }
+    });
   }
+}
+
+// Back-compat wrappers so existing callers keep working.
+function speak(text, { interrupt = false } = {}) {
+  say(text, { lang: "en", priority: interrupt ? PRI.ANSWER : PRI.AMBIENT });
+}
+async function speakResult(text, detectedLang) {
+  say(text, { lang: effectiveLang(detectedLang), priority: PRI.ANSWER });
+}
+
+// Capture the live video as a full-res JPEG blob (Read/Describe/Money/Cross).
+function captureBlob(q = 0.92) {
+  const cap = document.createElement("canvas");
+  cap.width = video.videoWidth; cap.height = video.videoHeight;
+  cap.getContext("2d").drawImage(video, 0, 0);
+  return new Promise((res) => cap.toBlob(res, "image/jpeg", q));
 }
 
 // --- Mode / action dispatch -------------------------------------------------
@@ -159,6 +217,7 @@ function setMode(next) {
   updateButtons();
   if (next === "read") doRead();
   else if (next === "describe") describeScene();
+  else if (next === "money") doMoney();
 }
 
 function updateButtons() {
@@ -170,7 +229,7 @@ function updateButtons() {
 function stopEverything() {
   if (navTimer) { clearInterval(navTimer); navTimer = null; }
   if (ws) { ws.close(); ws = null; }
-  stopTtsAudio();   // stop any Nepali MP3 still playing
+  stopTtsAudio();   // stop any Nepali clip still playing
   octx.clearRect(0, 0, overlay.width, overlay.height);
 }
 
@@ -198,22 +257,24 @@ function sendFrame() {
 function handleDetections(msg) {
   lastFrame = { fw: msg.fw, fh: msg.fh };
   drawBoxes(msg.boxes || []);
+  if (findTarget) checkFind(msg.boxes || []);   // active object-find guidance
 
-  // speak is now a list of {text, rate, urgent, urgency}.
+  // speak is a list of {text, text_ne, rate, urgent, urgency}.
   const items = msg.speak || [];
   if (!items.length) return;
 
+  const ne = effectiveLang() === "ne";          // navigate has no detected lang
+  const phrase = (it) => (ne ? (it.text_ne || it.text) : it.text);
   const anyUrgent = items.some((i) => i.urgent);
-  // Stay calm for normal announcements: don't pile up while already speaking.
-  if (!anyUrgent && (speechSynthesis.speaking || speechSynthesis.pending)) return;
-  // Very-close warnings interrupt whatever is playing so they land in time.
-  if (anyUrgent) speechSynthesis.cancel();
+  setStatus((anyUrgent ? "⚠️ " : "🔊 ") + items.map(phrase).join(", "));
 
-  setStatus((anyUrgent ? "⚠️ " : "🔊 ") + items.map((i) => i.text).join(", "));
+  // Route through the priority queue: hazards interrupt, ambient yields.
   for (const it of items) {
-    const u = new SpeechSynthesisUtterance(it.text);
-    u.rate = it.rate || 1.0;   // 1.3 for very-close so it sounds urgent
-    speechSynthesis.speak(u);
+    say(phrase(it), {
+      lang: ne ? "ne" : "en",
+      priority: it.urgent ? PRI.HAZARD : PRI.AMBIENT,
+      rate: it.rate || 1.0,
+    });
   }
 }
 
@@ -249,34 +310,29 @@ function drawBoxes(boxes) {
 }
 
 // --- Read mode (one-shot) ---------------------------------------------------
-async function doRead() {
+// labelMode=true asks the backend to also parse expiry/dosage/product (labels.py).
+async function doRead(labelMode = false) {
   if (!video.videoWidth) { setStatus("Camera not ready."); return; }
   buttons.read.setAttribute("aria-pressed", "true");   // show busy, don't latch
-  setStatus("Read: capturing…");
-  speak("Reading", { interrupt: true });
+  setStatus(labelMode ? "Read: checking label…" : "Read: capturing…");
 
-  // Capture at full resolution for the best OCR quality.
-  const cap = document.createElement("canvas");
-  cap.width = video.videoWidth;
-  cap.height = video.videoHeight;
-  cap.getContext("2d").drawImage(video, 0, 0);
-
-  const blob = await new Promise((res) => cap.toBlob(res, "image/jpeg", 0.92));
+  const blob = await captureBlob(0.92);
   const form = new FormData();
   form.append("file", blob, "frame.jpg");
+  if (labelMode) form.append("label", "true");
 
   setStatus("Read: recognizing text… (first run downloads OCR models, ~30s)");
   try {
     const resp = await fetch("/ocr", { method: "POST", body: form });
-    const data = await resp.json();              // {text, lang}
-    const text = (data.text || "").trim();
-    const lang = data.lang || "en";
+    const data = await resp.json();              // {text, text_ne?, lang}
+    const lang = effectiveLang(data.lang || "en");
+    const text = ((lang === "ne" && data.text_ne) ? data.text_ne : data.text || "").trim();
     lastResult = { text, lang };                 // remembered for Repeat
-    setStatus((effectiveLang(lang) === "ne" ? "📖 (ने) " : "📖 ") + text);
-    await speakResult(text, lang);               // Nepali -> /tts MP3, English -> Web Speech
+    setStatus((lang === "ne" ? "📖 (ने) " : "📖 ") + text);
+    say(text, { lang, priority: PRI.ANSWER });
   } catch (err) {
     setStatus("Read failed: " + err);
-    speak("Read failed", { interrupt: true });
+    say("Read failed", { priority: PRI.ANSWER });
   } finally {
     buttons.read.setAttribute("aria-pressed", "false");
   }
@@ -296,15 +352,18 @@ async function describeScene() {
   cap.height = video.videoHeight;
   cap.getContext("2d").drawImage(video, 0, 0);
 
+  const lang = effectiveLang();   // "ne" -> Gemini answers in Nepali (auto/en -> English)
   const blob = await new Promise((res) => cap.toBlob(res, "image/jpeg", 0.9));
   const form = new FormData();
   form.append("file", blob, "frame.jpg");
+  form.append("lang", lang);
 
   try {
     const resp = await fetch("/describe", { method: "POST", body: form });
     const text = (await resp.text()).trim();
-    setStatus("🗺️ " + text);
-    speak(text, { interrupt: true });
+    lastResult = { text, lang };                 // remembered for Repeat
+    setStatus((lang === "ne" ? "🗺️ (ने) " : "🗺️ ") + text);
+    await speakResult(text, lang);               // Nepali -> /tts WAV, English -> Web Speech
   } catch (err) {
     setStatus("Describe failed: " + err);
     speak("Describe failed", { interrupt: true });
@@ -313,10 +372,52 @@ async function describeScene() {
   }
 }
 
-// --- Repeat (re-speak last OCR result, no re-capture) -----------------------
+// --- Money mode (one-shot, TEMPORAL VOTING) ---------------------------------
+// Captures ~10 frames over ~1s and POSTs them to /money, which votes: a value is
+// announced only if one denomination wins a clear majority + passes the
+// confidence/margin gate -- so an empty wall/hand NEVER yields a denomination.
+const MONEY_FRAMES = 10, MONEY_GAP_MS = 90;
+
+async function doMoney() {
+  if (!video.videoWidth) { setStatus("Camera not ready."); return; }
+  buttons.money.setAttribute("aria-pressed", "true");   // show busy, don't latch
+  setStatus("Money: hold the note steady…");
+  say("Hold the note steady", { priority: PRI.ANSWER });
+
+  const form = new FormData();
+  for (let i = 0; i < MONEY_FRAMES; i++) {
+    form.append("files", await captureBlob(0.92), `f${i}.jpg`);
+    await new Promise((r) => setTimeout(r, MONEY_GAP_MS));
+  }
+
+  try {
+    const resp = await fetch("/money", { method: "POST", body: form });
+    const d = await resp.json();   // {available, ok, class, confidence, text, text_ne}
+    const lang = effectiveLang();
+    const phrase = lang === "ne" ? (d.text_ne || d.text) : d.text;
+
+    if (!d.available) {
+      setStatus("💵 " + phrase);                 // model not trained yet
+      say(phrase, { lang, priority: PRI.ANSWER });
+      return;
+    }
+    const pct = Math.round((d.confidence || 0) * 100);
+    const badge = d.ok ? "✓" : "⚠️";
+    setStatus(`💵 ${d.ok ? d.class : "no note"} — ${pct}% ${badge}  →  ${phrase}`);
+    lastResult = { text: phrase, lang };          // Repeat re-speaks it
+    say(phrase, { lang, priority: PRI.ANSWER });  // Nepali -> /tts, English -> Web Speech
+  } catch (err) {
+    setStatus("Money failed: " + err);
+    say("Money failed", { priority: PRI.ANSWER });
+  } finally {
+    buttons.money.setAttribute("aria-pressed", "false");
+  }
+}
+
+// --- Repeat (re-speak last Read/Describe result, no re-capture) -------------
 function repeatLast() {
   if (!lastResult || !lastResult.text) {
-    setStatus("Nothing to repeat yet — use Read first.");
+    setStatus("Nothing to repeat yet — use Read or Describe first.");
     speak("Nothing to repeat yet", { interrupt: true });
     return;
   }
@@ -339,26 +440,256 @@ function cycleLang() {
   speak("Language " + LANG_UI[langMode].say, { interrupt: true });  // audio cue for blind users
 }
 
+// ===========================================================================
+// VOICE CONTROL -- hands-free assistant (Web Speech recognition + shared parser)
+// ===========================================================================
+const VOICE_CONF = 0.45;           // below this recognition confidence -> "say again"
+let recog = null, listening = false, requireWake = true;
+let findTarget = null, findState = { zone: null, close: null, t: 0 };
+const captionEl = document.getElementById("caption");
+const btnVoice  = document.getElementById("btnVoice");
+
+function setCaption(t) { if (captionEl) captionEl.textContent = t ? ("🗣 " + t) : ""; }
+function confirmSay(en, ne) {
+  say(langMode === "ne" ? ne : en, { lang: langMode === "ne" ? "ne" : "en", priority: PRI.ANSWER });
+}
+function ensureNavigate() {         // assistant default: Navigate runs underneath
+  if (mode !== "navigate") { stopEverything(); mode = "navigate"; updateButtons(); startNavigate(); }
+}
+
+function initRecognition() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { setStatus("Voice not supported here — use Chrome or Edge."); return null; }
+  const r = new SR();
+  r.continuous = true; r.interimResults = true;
+  r.lang = (langMode === "ne") ? "ne-NP" : "en-US";
+  r.onresult = onRecog;
+  r.onerror  = () => {};                                            // never throw
+  r.onend    = () => { if (listening) { try { r.start(); } catch (_) {} } };   // auto-restart
+  r.onspeechstart = () => { if (curPlaying) stopSpeech(true); };    // BARGE-IN: user talks -> stop
+  return r;
+}
+
+function toggleVoice() {
+  if (listening) {
+    listening = false; if (recog) { try { recog.stop(); } catch (_) {} }
+    btnVoice.setAttribute("aria-pressed", "false"); btnVoice.textContent = "🎤 Voice";
+    setCaption(""); confirmSay("Voice off", "आवाज नियन्त्रण बन्द"); return;
+  }
+  recog = initRecognition(); if (!recog) return;
+  listening = true;
+  btnVoice.setAttribute("aria-pressed", "true"); btnVoice.textContent = "🎤 Voice: On";
+  try { recog.start(); } catch (_) {}
+  confirmSay("Voice on. Say hey sight, then a command. Say hey sight help for options.",
+             "आवाज चालु। हे साइट भनेर आदेश दिनुहोस्।");
+}
+
+async function onRecog(e) {
+  let interim = "", final = "", conf = 1;
+  for (let i = e.resultIndex; i < e.results.length; i++) {
+    const res = e.results[i];
+    if (res.isFinal) { final += res[0].transcript; conf = res[0].confidence || 0; }
+    else interim += res[0].transcript;
+  }
+  if (interim) setCaption("… " + interim);
+  if (!final.trim()) return;
+  setCaption(final.trim());
+  try {
+    const form = new FormData(); form.append("text", final); form.append("conf", conf);
+    const cmd = await (await fetch("/command", { method: "POST", body: form })).json();
+    dispatchVoice(cmd, conf);
+  } catch (_) {}
+}
+
+function dispatchVoice(cmd, conf) {
+  if (requireWake && !cmd.wake) return;                       // ignore background speech
+  if (cmd.action === "none") { if (cmd.wake) confirmSay("Yes?", "भन्नुहोस्?"); return; }
+  if (conf > 0 && conf < VOICE_CONF) { confirmSay("Sorry, say that again", "माफ गर्नुहोस्, फेरि भन्नुहोस्"); return; }
+  runAction(cmd);
+}
+
+// Map a parsed command to the EXISTING mode handlers (no duplicated logic).
+function runAction(cmd) {
+  switch (cmd.action) {
+    case "navigate":    confirmSay("Navigating", "हिँड्दै"); ensureNavigate(); break;
+    case "describe":    confirmSay("Describing", "वर्णन गर्दै"); describeScene(); break;
+    case "read":        confirmSay("Reading", "पढ्दै"); doRead(false); break;
+    case "label":       confirmSay("Checking the label", "लेबल हेर्दै"); doRead(true); break;
+    case "money":       confirmSay("Checking the note", "नोट हेर्दै"); doMoney(); break;
+    case "money_add":   moneyTally("add"); break;
+    case "money_total": moneyTally("total"); break;
+    case "money_clear": moneyTally("clear"); break;
+    case "money_undo":  moneyTally("undo"); break;
+    case "money_pay":   moneyTally("pay", cmd.target); break;
+    case "cross":       doCross(); break;
+    case "find":        startFind(cmd.target); break;
+    case "who":         doWho(); break;
+    case "remember":    doRemember(cmd.target); break;
+    case "repeat":      repeatLast(); break;
+    case "stop":        stopSpeech(true); exitFind(); setCaption(""); break;
+    case "louder":      adjustVolume(+0.15); break;
+    case "softer":      adjustVolume(-0.15); break;
+    case "faster":      adjustRate(+0.15); break;
+    case "slower":      adjustRate(-0.15); break;
+    case "help":        sayHelp(); break;
+  }
+}
+
+function adjustVolume(d) {
+  voiceVolume = Math.max(0.1, Math.min(1, voiceVolume + d));
+  confirmSay(`Volume ${Math.round(voiceVolume*100)} percent`, `आवाज ${Math.round(voiceVolume*100)} प्रतिशत`);
+}
+function adjustRate(d) {
+  voiceRate = Math.max(0.5, Math.min(2, voiceRate + d));
+  confirmSay(`Speed ${voiceRate.toFixed(1)}`, `गति ${voiceRate.toFixed(1)}`);
+}
+function sayHelp() {
+  confirmSay(
+    "You can say: navigate, what's in front, read this, read the label, how much, add this note, total, can I cross, find my, who's here, repeat, louder, slower, or stop.",
+    "तपाईं भन्न सक्नुहुन्छ: हिँड, अगाडि के छ, पढ, लेबल पढ, कति, नोट जोड, कुल, बाटो काट, खोज, यहाँ को छ, दोहोर्याउ, ठूलो, ढिलो, वा रोक।");
+}
+
+async function doCross() {
+  try {
+    const r = await (await fetch("/cross", { method: "POST" })).json();
+    const lang = effectiveLang();
+    const text = lang === "ne" ? (r.text_ne || r.text) : r.text;
+    setStatus("🚦 " + text);
+    say(text, { lang, priority: r.urgent ? PRI.HAZARD : PRI.ANSWER });
+  } catch (_) { confirmSay("Could not check the crossing", "बाटो जाँच्न सकिएन"); }
+}
+
+async function moneyTally(op, amount) {
+  const form = new FormData();
+  form.append("op", op);
+  if (amount) form.append("amount", amount);
+  if (op === "add") {
+    if (!video.videoWidth) { confirmSay("Camera not ready", "क्यामेरा तयार छैन"); return; }
+    form.append("file", await captureBlob(0.92), "frame.jpg");
+  }
+  try {
+    const r = await (await fetch("/money/tally", { method: "POST", body: form })).json();
+    const lang = effectiveLang();
+    const text = lang === "ne" ? (r.text_ne || r.text) : r.text;
+    lastResult = { text, lang };
+    setStatus("💵 " + text);
+    say(text, { lang, priority: PRI.ANSWER });
+  } catch (_) { confirmSay("Money command failed", "आदेश असफल भयो"); }
+}
+
+// Faces: "who's here" and "remember this person as {name}".
+async function doWho() {
+  if (!video.videoWidth) { confirmSay("Camera not ready", "क्यामेरा तयार छैन"); return; }
+  setStatus("👤 Looking for familiar faces…");
+  const form = new FormData(); form.append("file", await captureBlob(0.92), "frame.jpg");
+  try {
+    const r = await (await fetch("/faces/who", { method: "POST", body: form })).json();
+    const lang = effectiveLang();
+    const text = lang === "ne" ? (r.text_ne || r.text) : r.text;
+    lastResult = { text, lang }; setStatus("👤 " + text);
+    say(text, { lang, priority: PRI.ANSWER });
+  } catch (_) { confirmSay("Could not check who's here", "को छ भन्न सकिएन"); }
+}
+async function doRemember(name) {
+  if (!name) { confirmSay("Remember them as what name?", "कुन नाममा सम्झने?"); return; }
+  if (!video.videoWidth) { confirmSay("Camera not ready", "क्यामेरा तयार छैन"); return; }
+  setStatus("👤 Remembering " + name + "…");
+  const form = new FormData();
+  form.append("name", name); form.append("file", await captureBlob(0.92), "frame.jpg");
+  try {
+    const r = await (await fetch("/faces/enroll", { method: "POST", body: form })).json();
+    const lang = effectiveLang();
+    const text = lang === "ne" ? (r.text_ne || r.text) : r.text;
+    setStatus("👤 " + text);
+    say(text, { lang, priority: PRI.ANSWER });
+  } catch (_) { confirmSay("Could not save that face", "अनुहार सेभ गर्न सकिएन"); }
+}
+
+// FIND mode: actively guide the user to an object, riding on the Navigate stream.
+function startFind(target) {
+  if (!target) { confirmSay("Find what?", "के खोज्ने?"); return; }
+  findTarget = target.toLowerCase();
+  findState = { zone: null, close: null, t: 0 };
+  confirmSay("Looking for " + target, "खोज्दै " + target);
+  ensureNavigate();
+}
+function exitFind() { findTarget = null; findState = { zone: null, close: null, t: 0 }; }
+function boxArea(b) { const [x1, y1, x2, y2] = b.box; return (x2 - x1) * (y2 - y1); }
+
+function checkFind(boxes) {
+  const matches = boxes.filter((b) => {
+    const l = (b.label || "").toLowerCase();
+    return l.includes(findTarget) || findTarget.includes(l);
+  });
+  if (!matches.length) {
+    if (Date.now() - findState.t > 4000) {           // rate-limited nudge
+      findState.t = Date.now();
+      confirmSay(`I don't see a ${findTarget}, try turning slowly`,
+                 `${findTarget} देखिएन, बिस्तारै घुम्नुहोस्`);
+    }
+    return;
+  }
+  matches.sort((a, b) => boxArea(b) - boxArea(a));   // nearest/biggest first
+  const m = matches[0];
+  const [x1, , x2] = m.box;
+  const cx = (x1 + x2) / 2;
+  const ar = boxArea(m) / Math.max(lastFrame.fw * lastFrame.fh, 1);
+  const zone = cx < lastFrame.fw / 3 ? "on your left"
+             : cx > 2 * lastFrame.fw / 3 ? "on your right" : "ahead";
+  const close = ar > 0.20 ? "very" : ar > 0.05 ? "near" : "far";
+  if (zone === "ahead" && close === "very") {        // centered + close -> found, auto-exit
+    confirmSay(`${findTarget} right in front. Found it.`, `${findTarget} ठीक अगाडि। भेटियो।`);
+    exitFind(); return;
+  }
+  if (zone !== findState.zone || close !== findState.close) {   // announce on real change
+    findState.zone = zone; findState.close = close;
+    let phrase = `${findTarget} ${zone}`;
+    if (close === "near") phrase += ", getting closer";
+    say(phrase, { lang: "en", priority: PRI.ANSWER });
+  }
+}
+
+// DEMO mode: step the hero sequence on cue (key D) so a live demo can't stall.
+const DEMO = [
+  { label: "Read a sign", run: () => doRead(false) },
+  { label: "Crossing light", run: () => doCross() },
+  { label: "Who's here", run: () => doWho() },
+  { label: "Identify a banknote", run: () => doMoney() },
+];
+let demoIdx = 0;
+function nextDemo() {
+  const step = DEMO[demoIdx % DEMO.length]; demoIdx++;
+  setStatus(`🎬 DEMO ${((demoIdx - 1) % DEMO.length) + 1}/${DEMO.length}: ${step.label}`);
+  step.run();
+}
+
 // --- Wire up ----------------------------------------------------------------
 buttons.navigate.addEventListener("click", () => setMode("navigate"));
 buttons.read.addEventListener("click",     () => setMode("read"));
 buttons.describe.addEventListener("click", () => setMode("describe"));
+buttons.money.addEventListener("click",    () => setMode("money"));
 btnRepeat.addEventListener("click", repeatLast);   // action, not a mode
 btnLang.addEventListener("click", cycleLang);
+if (btnVoice) btnVoice.addEventListener("click", toggleVoice);
 
 document.addEventListener("keydown", (e) => {
   if (e.key === "1") setMode("navigate");
   else if (e.key === "2") setMode("read");
   else if (e.key === "3") setMode("describe");
-  else if (e.key === "4" || e.key.toLowerCase() === "r") repeatLast();
-  else if (e.key === "5" || e.key.toLowerCase() === "l") cycleLang();
+  else if (e.key === "4" || e.key.toLowerCase() === "m") setMode("money");
+  else if (e.key === "5" || e.key.toLowerCase() === "r") repeatLast();
+  else if (e.key === "6" || e.key.toLowerCase() === "l") cycleLang();
+  else if (e.key === "7" || e.key.toLowerCase() === "v") toggleVoice();
+  else if (e.key === "8" || e.key.toLowerCase() === "d") nextDemo();
+  else if (e.key.toLowerCase() === "c") doCross();
+  else if (e.key.toLowerCase() === "h") sayHelp();
 });
 
 // --- Camera startup ---------------------------------------------------------
 navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false })
   .then((stream) => {
     video.srcObject = stream;
-    video.onloadedmetadata = () => setStatus("Ready. Press 1 to Navigate, 2 to Read, 3 to Describe.");
+    video.onloadedmetadata = () => setStatus("Ready. Press 7 (or 🎤) for hands-free voice, or 1 to Navigate.");
   })
   .catch((err) => setStatus("Camera error: " + err.message + " (allow camera access and reload)"));
 </script>

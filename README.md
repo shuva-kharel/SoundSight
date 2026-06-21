@@ -15,46 +15,68 @@ browser ──(downscaled JPEG frames)──►  server.py  ──►  vision_co
 ```
 
 ## Modes
-- **Navigate** — streams frames, draws bounding boxes, and speaks e.g.
-  `"person ahead"`, `"chair on your left"`. It stays calm: max 2 items/frame, each
-  object+zone is announced at most once per **2.5s** cooldown, and **very-close**
-  hazards (`area_ratio > 0.20`) bypass that to re-warn every **1s**.
+- **Navigate** — streams frames, draws boxes, and speaks. It is **event-driven**:
+  it announces a thing **once** ("two people ahead", "chair on your left") and then
+  stays quiet — it only speaks again when something actually *changes* (see below),
+  so it never loops "caution, person nearby" at you.
 
-### Detection pipeline (navigation-focused, anti-spam)
-The whole pipeline lives behind `VisionCore.detect_and_rank()` in
-[`vision_core.py`](vision_core.py) and is built to be *clean and stable* rather
-than detect-everything:
-1. **Model** — set by `MODEL_MODE` (top of the file):
-   - `"coco"` *(default)* — `yolo11s.pt`, 80 COCO classes; fast, accurate, and
-     almost all nav-relevant.
-   - `"openvocab"` — YOLO-World restricted to `OPENVOCAB_CLASSES` (best fit; only
-     detects what a blind user needs). First use auto-installs CLIP via
-     ultralytics — you may need to restart the server once.
-   - `"oiv7"` — `yolov8s-oiv7.pt` (~600 classes) behind the same filters.
-2. **Allowlist** — only `NAVIGATION_CLASSES` (person, vehicles, doors, stairs,
-   furniture, poles…) survive; everything else is dropped, and synonyms are
-   grouped to one spoken word (`sofa→couch`, `dining table→table`).
-3. **Part removal** — `PART_CLASSES` (glasses, human face/hand/arm, footwear,
-   clothing…) are always discarded, plus worn/held items mostly inside a person
-   box are suppressed.
-4. **Per-class confidence** — `CONF_THRESHOLDS` (person 0.40, vehicles/furniture
-   0.45, structure 0.50, small/ambiguous 0.55).
-5. **Temporal smoothing** — an object is only announced after it's seen in **3 of
-   the last 5 frames**, killing single-frame flickers/ghosts.
-6. **Ranking** — by closeness, then importance (person/vehicles/stairs/poles
-   highest), capped at 2 spoken items.
+### Detection pipeline
+Everything lives behind `VisionCore.detect_and_rank()` in
+[`vision_core.py`](vision_core.py):
+1. **Persistent tracking** — `model.track(persist=True, bytetrack)` gives every
+   object a stable `track_id` across frames (with `iou=0.5, agnostic_nms=True,
+   max_det=50`). Tracking removes single-frame false positives (a blip never earns
+   an id) and is what makes event-driven speech possible. Falls back to
+   `predict()` + `(label,zone)` keys if a model can't track.
+2. **Model** — `MODEL_MODE`: `"coco"` *(default, `.pt`)* · `"coco-ncnn"` *(Pi)* ·
+   `"openvocab"` (YOLO-World) · `"oiv7"`. Size via `MODEL_ACCURACY`:
+   `"fast"`=yolo11n (Pi/NCNN) · `"balanced"`=yolo11s (laptop default) ·
+   `"accurate"`=yolo11m (GPU). Bigger = more accurate, slower.
+3. **Detect everything** — `DETECT_ALL = True`: no allowlist drop; every class the
+   model knows (bottle, cup, chair, bag, phone…) is detected. `NAVIGATION_CLASSES`
+   only *prioritizes* ranking; `SYNONYMS` give nicer words and never remove a class.
+4. **Per-class confidence** — `DEFAULT_CONF = 0.35`; person/vehicles 0.40.
+5. **Geometry-only part removal** — a non-person box is dropped only if >70% inside
+   a larger person box **and** <30% of its area (glasses/face on a person). A
+   standalone bottle/cup/bag is never dropped.
+6. **Temporal smoothing** — secondary confirm at **2-of-3** frames (tracking already
+   stabilizes).
 
-The console logs `raw=… kept=… dropped: …` (~once/second) so you can tune
-thresholds. To detect non-navigation items again (e.g. **pen**, **headphones**),
-add them to `NAVIGATION_CLASSES` and use `"oiv7"` or `"openvocab"` mode — the
-default is deliberately navigation-only.
+### Event-driven announcements (the anti-repeat core)
+`AnnouncementManager` keeps per-`track_id` memory and speaks **only on an event**:
+- **NEW** — a confirmed object/group not introduced yet.
+- **ESCALATION** — its urgency rose a tier (far→near→very close). De-escalation is
+  **silent**.
+- **ZONE CHANGE / COUNT** — it moved zones (held past a deadband) or a group gained a
+  member ("two people ahead").
+- **REFRESH** — after `REFRESH_SILENCE` (8 s) of silence, it restates the single most
+  important object so you're never left guessing.
+
+A stable object that doesn't change is **never repeated**. **Hysteresis** deadbands
+(`ZONE_DEADBAND`, `URGENCY_MARGIN`) stop boundary/threshold flip-flop. Objects are
+**grouped + counted** with plurals; events are ranked **very-close hazards first**,
+capped at `MAX_PER_CYCLE` (2). Tune it all via the constants at the top of
+[`vision_core.py`](vision_core.py) (`REFRESH_SILENCE, ZONE_DEADBAND, URGENCY_MARGIN,
+MAX_PER_CYCLE, FORGET, MIN_GAP`). Every 15th frame the console logs `RAW`/`KEPT` +
+active `track_ids`; whenever it speaks it logs **why** (`[new]/[escalation]/[change]/
+[refresh]`).
+
+### Raspberry Pi
+[`pi_app.py`](pi_app.py) is the on-device entrypoint: it reads the Pi camera and
+speaks through **espeak-ng** (offline), running the same pipeline in `"coco-ncnn"`
+(NCNN nano on the ARM CPU). `python pi_app.py` — `sudo apt install espeak-ng` for
+audio. It exports the NCNN model once on first run.
 - **Read** — captures one full-res frame, runs **bilingual OCR (Nepali +
   English)** via `POST /ocr` (returns `{text, lang}`), and speaks it. English is
-  spoken with the browser's Web Speech API; **Nepali** (Devanagari) is sent to
-  `POST /tts`, which uses **gTTS** to return an MP3 the browser plays — because
-  the offline browser voice reads Devanagari poorly. **gTTS needs internet**; for
-  the Pi, swap `_synth_mp3()` in [`server.py`](server.py) for an offline Nepali
-  TTS (espeak-ng / Piper / Coqui), same contract.
+  spoken with the browser's Web Speech API; **Nepali** (Devanagari) goes to
+  `POST /tts`, which is **tiered** for the best quality: (1) a **pre-recorded file**
+  from `audio/ne/` for the fixed vocabulary (denominations, navigation, warnings —
+  best, offline); (2) **gTTS** for arbitrary OCR text (good, online); (3)
+  **espeak-ng** offline fallback (low quality, always works). Generate the
+  pre-recorded set once with `python gen_voice.py` (online), and edit the table in
+  [`nepali_phrases.py`](nepali_phrases.py). OCR'd Devanagari is normalized first.
+  Install espeak-ng: Windows `winget install eSpeak-NG.eSpeak-NG`, Pi/Linux
+  `sudo apt install espeak-ng`.
 - **Repeat** (key **4** or **R**) — re-speaks the last Read result without
   re-capturing (handy if you missed it or want it slower to follow).
 - **Language** (key **5** or **L**) — cycles **Auto → English → नेपाली**. Auto
@@ -66,6 +88,16 @@ default is deliberately navigation-only.
   Needs a `GEMINI_API_KEY` (see below). The provider is isolated in
   `SceneDescriber.describe()` ([`vision_core.py`](vision_core.py)) — swap it for a
   local VLM or another API without touching the server or browser.
+- **Money** (key **4** or **M**) — reads the held Nepali rupee note and says its
+  value ("Five hundred rupees" / "पाँच सय रुपैयाँ"). It will **never invent a
+  denomination** at a wall/hand: `BanknoteClassifier` ([`vision_core.py`](vision_core.py))
+  uses a quality pre-check, a central-ROI crop, a **confidence + margin gate**
+  (`MONEY_CONF` 0.85, `MONEY_MARGIN` 0.30), a **background → "no note"** class, and
+  the key fix — **temporal voting** over ~10 frames (`MONEY_VOTES`/`MONEY_MIN_AGREE`):
+  a value is announced only if it wins a clear majority, else *"no note detected"* /
+  *"couldn't read clearly, try again"*. The browser sends the frame burst to
+  `POST /money`. Train with [`train_banknote.py`](train_banknote.py) — **collect a
+  large, varied `background` (no-note) class** for the strongest rejection.
 
 ### Proximity urgency (Navigate)
 Each detection's closeness is estimated from how much of the frame it fills,
@@ -141,10 +173,87 @@ The first run downloads the detection model (`yolo11s.pt`, ~19 MB) automatically
 The first time you use **Read**, EasyOCR downloads its Nepali + English models —
 Navigate is unaffected.
 
+## Accuracy & robustness layer
+A wearable camera sees bad light, motion blur and tilt, so every mode runs frames
+through one shared QA layer, [`frame_quality.py`](frame_quality.py):
+- **`enhance()`** — CLAHE adaptive contrast (+ auto-gamma when dark), applied before
+  every inference/OCR. The single biggest real-world accuracy win. Toggle with
+  `ENHANCE_FRAMES`; the Pi auto-disables it under load.
+- **`assess()`** — brightness + blur (variance of Laplacian). Junk frames are
+  **skipped** instead of emitting false positives; if a bad view persists ~2 s the
+  app says *"camera view is dark/unclear"* once (rate-limited, bilingual).
+
+Per-mode upgrades, all degrade gracefully on the Pi (`coco-ncnn`, CPU):
+- **Navigate** — model tiers (`fast`=yolo11n@320 / `balanced`=yolo11s@640 /
+  `accurate`=yolo11m@640 +TTA; Pi never uses `accurate`). **Class-aware urgency**
+  (`URGENCY_SCALE`): a nearby *person/vehicle* triggers "very close", a same-size
+  *bottle/phone* does not. **Path weighting**: things in your walking line (center +
+  lower frame) are announced first. ByteTrack + the event-driven `AnnouncementManager`
+  (no spam) are unchanged; per-track memory is capped (`MAX_TRACKS`).
+- **Read** — CLAHE → 2× upscale → deskew before EasyOCR; per-box confidence filter
+  (`OCR_CONF`), natural top→bottom/left→right ordering, and a **sideways rescue**
+  (retries 90/180/270° if low-confidence). Refuses to read blurry/dark junk.
+- **Describe** — **works offline**: with no key or no internet it synthesizes a
+  spoken description from the current detections (`describe_from_detections`, e.g.
+  *"In front of you: two people ahead, a chair on your left."*); online it adds an
+  ~8 s timeout + one retry and a hazard/stairs/doorway/sign-reading prompt.
+
+Camera health (covered/frozen/yanked cam) and a Pi **perf guard** (drop imgsz 320→256
+and disable enhance below `FPS_FLOOR`, restore when it recovers) keep the loop alive;
+every mode's errors are isolated so one can't crash Navigate. All knobs are top-of-file
+constants in [`frame_quality.py`](frame_quality.py) / [`vision_core.py`](vision_core.py).
+
+## Hands-free voice control (the assistant)
+Press **7** / 🎤 (or `V`) to start listening. It's an always-on assistant with
+**Navigate as the ambient default**; commands switch modes and return to Navigate.
+- **Wake word**: say **"hey sight …"** so background speech is ignored. ("hey sight,
+  read this" / "hey sight, how much".) Bare "hey sight" → "Yes?".
+- **Barge-in**: start talking and the assistant stops speaking and listens.
+- **Priority speech**: only one thing speaks at a time — hazards > command answers >
+  ambient navigation.
+- **Bilingual**: English *and* Nepali keywords (पढ = read, कति = how much, अगाडि के छ =
+  what's ahead, बाटो काट = cross, यो को हो = who's here, नोट जोड = add note…).
+- **Commands**: navigate · what's in front (Describe) · read this · read the label ·
+  how much · add this note / total / clear / undo / "pay 500" · can I cross · find my
+  {object} · who's here · remember this person as {name} · repeat · louder/softer/
+  slower/faster · stop · **help**. A live caption shows what was heard.
+- **Keys** also work: `C` crossing · `H` help · `D` steps the **DEMO** sequence
+  (read → crossing → who's here → banknote) so a live demo can't stall.
+
+The shared parser is [`commands.py`](commands.py) — the browser POSTs transcripts to
+`/command` and the Pi calls it directly, so both use identical logic.
+
+### Crossing, labels, money tally, faces
+- **Crossing** ([`crossing.py`](crossing.py)) — classifies a traffic light's color by
+  HSV, with **hysteresis** (confirmed changes only) and **fail-safe** wording
+  ("green … *looks* clear, listen for vehicles"; unclear/conflicting → "be careful").
+  Runs inside Navigate and answers "can I cross".
+- **Label reading** ([`labels.py`](labels.py)) — "read the label" parses expiry/MFG
+  dates (incl. **Bikram Sambat**), dosage, and product name → "This expired 2 months
+  ago", etc. Normal Read is unchanged.
+- **Money tally** ([`money.py`](money.py)) — "add this note / total / undo / pay 500"
+  keeps a running sum and computes change with a note breakdown, in EN + NE. Requires
+  classifier confidence > 0.7 to add.
+- **Faces** (opt-in, local) ([`faces.py`](faces.py)) — greets enrolled people by name
+  in Navigate and answers "who's here". Enroll first (consent-first):
+  `python face_enroll.py --name Ram`. Needs a provider:
+  `pip install insightface onnxruntime` (best) or `pip install face_recognition`.
+  Disabled gracefully if neither is installed.
+
+## Self-test
+Verify the moving parts before a demo (PASS/FAIL per check):
+```bash
+python server.py --selftest   # model, frame-QA, banknote, espeak-ng, EasyOCR, Gemini key
+python pi_app.py --selftest    # camera opens + returns a frame, NCNN model, audio, SoC temp
+python pi_app.py --list-cameras  # probe camera indices 0-4 (OS-aware backend)
+```
+
 ## Logging
 On startup the backend prints which device YOLO uses (`CUDA` or `CPU`). During
-Navigate it logs FPS every 30 frames and the OCR character count / latency per
-read.
+Navigate the 15-frame debug log adds **frame brightness + blur score**, whether
+**enhance** ran, the imgsz, **why** each object was announced
+(`new/escalation/change/refresh`), OCR **mean confidence** per Read, and whether
+Describe used **Gemini or the offline fallback**.
 
 ## GPU notes (your RTX 5060 / Blackwell)
 
