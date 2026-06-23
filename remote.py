@@ -23,8 +23,6 @@ import socket
 import time
 import urllib.request
 
-import cv2
-
 log = logging.getLogger("soundsight.remote")
 
 # --- config (env-overridable so you don't edit code at the venue) ----------- #
@@ -37,6 +35,8 @@ MAX_SEND_W = 960           # downscale wide frames before sending
 
 
 def _encode(frame, q=JPEG_QUALITY, max_w=MAX_SEND_W):
+    import cv2
+
     h, w = frame.shape[:2]
     if w > max_w:
         frame = cv2.resize(frame, (max_w, int(h * max_w / w)))

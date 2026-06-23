@@ -50,6 +50,7 @@ speaker-test -t sine -f 440 -l 1 # quick check; espeak-ng "hello" should be audi
 ## 5. Verify, then run
 ```bash
 python pi_app.py --selftest      # PASS/FAIL: camera frame, NCNN model+infer, audio, temp
+python pi_app.py --diag-imports  # if startup segfaults: isolate cv2/torch/ultralytics
 python pi_app.py --list-cameras  # which index your webcam is on (0/1/2…)
 python pi_app.py                 # run. Ctrl+C to stop.
 ```

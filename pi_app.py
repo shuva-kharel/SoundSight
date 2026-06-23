@@ -22,22 +22,51 @@ identical on-device. It adds the on-device robustness the browser doesn't need:
 """
 
 import argparse
+import faulthandler
+import importlib
 import logging
+import os
 import subprocess
+import sys
 import time
 
-import camera as cam
-import frame_quality as fq
-from remote import RemoteCompute, find_server
-from vision_core import (
-    FPS_FLOOR,
-    AnnouncementManager,
-    ApproachDetector,
-    QualityGate,
-    VisionCore,
-    find_espeak,
-    select_announcements,
-)
+faulthandler.enable()
+
+# Native math/video libraries can oversubscribe the Pi and occasionally crash
+# inside C/C++ extension code. Keep them conservative before cv2/torch import.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
+
+
+def _import_module(name):
+    try:
+        return importlib.import_module(name)
+    except Exception as exc:
+        log.exception("Failed to import %s: %s", name, exc)
+        raise
+
+
+def _import_camera():
+    return _import_module("camera")
+
+
+def _import_frame_quality():
+    return _import_module("frame_quality")
+
+
+def _import_remote():
+    return _import_module("remote")
+
+
+def _import_vision_core():
+    return _import_module("vision_core")
+
+
+def _import_commands():
+    return _import_module("commands")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,7 +95,7 @@ class Speaker:
     printing if espeak-ng isn't installed."""
 
     def __init__(self):
-        self.exe = find_espeak()
+        self.exe = self._find_espeak()
         self.wpm = 165       # speed (words/min)
         self.amp = 130       # volume (espeak -a, 0..200)
         self.proc = None
@@ -75,6 +104,13 @@ class Speaker:
         else:
             log.warning("espeak-ng not found -- printing announcements "
                         "(install with: sudo apt install espeak-ng)")
+
+    def _find_espeak(self):
+        try:
+            return _import_module("vision_core").find_espeak()
+        except Exception as exc:
+            log.warning("Offline TTS unavailable: %s", exc)
+            return None
 
     def speak(self, text, voice="en"):
         if not text:
@@ -182,7 +218,7 @@ def soc_temp_c():
         return None
 
 
-def _build_dispatch(speaker, banknote, crossing_mon, mtally, shared, remote):
+def _build_dispatch(speaker, banknote, crossing_mon, mtally, shared, fq, remote):
     """Return on_command(text): parse a voice transcript and run the matching Pi
     handler. On-demand heavy features (Read/Money/Faces/Describe) OFFLOAD to the
     laptop compute server when it's reachable, else fall back to the Pi's local
@@ -297,11 +333,15 @@ def _build_dispatch(speaker, banknote, crossing_mon, mtally, shared, remote):
 
 
 def run(server_url=None):
-    # NCNN nano on the Pi's CPU. (On a laptop this also works; it just exports the
-    # NCNN model once on first run.) Swap mode="coco" for the plain .pt model.
+    # Import the Pi-only dependencies lazily so startup errors are reported cleanly.
+    cam = _import_camera()
+    fq = _import_frame_quality()
+    remote_mod = _import_remote()
+    vc = _import_vision_core()
     from crossing import CrossingMonitor
     from money import MoneyTally
-    from vision_core import BanknoteClassifier
+    from vision_core import BanknoteClassifier, FPS_FLOOR
+    from vision_core import AnnouncementManager, ApproachDetector, QualityGate, VisionCore, select_announcements
 
     vision = VisionCore(mode="coco-ncnn", accuracy="fast")
     manager = AnnouncementManager()
@@ -311,7 +351,7 @@ def run(server_url=None):
     speak = speaker.speak
 
     # Distributed compute: offload heavy on-demand AI to the laptop if reachable.
-    remote = RemoteCompute(server_url)
+    remote = remote_mod.RemoteCompute(server_url)
     if remote.enabled:
         log.info("Compute offload target: %s (checking...)", remote.url)
         remote.health(force=True)
@@ -324,7 +364,7 @@ def run(server_url=None):
     mtally = MoneyTally()
     shared = {"frame": None, "dets": [], "find": None, "last": ""}
     if VOICE_ENABLED:
-        start_voice(_build_dispatch(speaker, banknote, crossing_mon, mtally, shared, remote),
+        start_voice(_build_dispatch(speaker, banknote, crossing_mon, mtally, shared, fq, remote),
                     on_partial=speaker.stop)   # on_partial -> barge-in
     else:
         log.info("Pi voice control DISABLED (VOICE_ENABLED=False). "
@@ -439,6 +479,11 @@ def run(server_url=None):
 def selftest():
     """PASS/FAIL report: camera opens + returns a real frame, model loads + runs one
     inference, and audio (espeak-ng) is available. Exits 0 if all pass."""
+    cam = _import_camera()
+    remote_mod = _import_remote()
+    vc = _import_vision_core()
+    from vision_core import VisionCore, find_espeak
+
     print("\n==================  SoundSight Pi self-test  ==================")
     results = []
 
@@ -473,7 +518,7 @@ def selftest():
         find_espeak() or "MISSING -- sudo apt install espeak-ng (Pi) / winget (Windows)"))
 
     def remote_check():
-        rc = RemoteCompute()
+        rc = remote_mod.RemoteCompute()
         if not rc.enabled:
             return True, "offload disabled (no COMPUTE_SERVER_URL) -- runs on-device"
         import time as _t
@@ -494,23 +539,63 @@ def selftest():
     raise SystemExit(0 if all(results) else 1)
 
 
+def diag_imports():
+    """Run risky native imports in child processes so a segfault is isolated and
+    reported instead of taking this diagnostic command down with it."""
+    checks = [
+        ("numpy", "import numpy; print('numpy', numpy.__version__)"),
+        ("cv2", "import cv2; print('cv2', cv2.__version__)"),
+        ("torch", "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"),
+        ("ultralytics", "from ultralytics import YOLO; print('ultralytics YOLO import ok')"),
+        ("vision_core", "import vision_core; print('vision_core import ok')"),
+        ("camera", "import camera; print('camera import ok')"),
+    ]
+    print("\n================ SoundSight Pi native import diagnostic ================")
+    failed = False
+    for name, code in checks:
+        proc = subprocess.run(
+            [sys.executable, "-X", "faulthandler", "-c", code],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+        )
+        ok = proc.returncode == 0
+        failed = failed or not ok
+        print(f"  [{'PASS' if ok else 'FAIL'}] {name:12} exit={proc.returncode}")
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        if out:
+            print("       " + out.replace("\n", "\n       "))
+        if err:
+            print("       " + err.replace("\n", "\n       "))
+    print("=======================================================================")
+    raise SystemExit(1 if failed else 0)
+
+
 def main():
     ap = argparse.ArgumentParser(description="SoundSight Raspberry Pi entrypoint")
     ap.add_argument("--selftest", action="store_true",
                     help="check camera/model/audio/offload and exit with a PASS/FAIL report")
+    ap.add_argument("--diag-imports", action="store_true",
+                    help="isolate native import crashes for cv2/torch/ultralytics")
     ap.add_argument("--list-cameras", action="store_true",
                     help="probe camera indices 0-4 (OS-aware backend) and exit")
     ap.add_argument("--find-server", action="store_true",
                     help="scan the LAN for the laptop compute server, then run using it")
     args = ap.parse_args()
-    if args.list_cameras:
+    if args.diag_imports:
+        diag_imports()
+    elif args.list_cameras:
+        cam = _import_camera()
         cam.list_cameras()
     elif args.selftest:
         selftest()
     else:
         server_url = None
         if args.find_server:
-            server_url = find_server()      # auto-discover on the subnet
+            remote_mod = _import_remote()
+            server_url = remote_mod.find_server()      # auto-discover on the subnet
             if server_url:
                 log.info("Using compute server: %s", server_url)
             else:

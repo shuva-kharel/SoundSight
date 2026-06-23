@@ -1,26 +1,25 @@
-# SoundSight -- Raspberry Pi 4 dependencies (64-bit Raspberry Pi OS).
+# SoundSight -- Raspberry Pi 4 dependencies (64-bit Raspberry Pi OS, aarch64).
 #
-# *** The OS MUST be 64-bit (aarch64). *** On ARM, `ultralytics` pulls the
-# aarch64 CPU build of torch automatically -- there is NO CUDA on the Pi, so do
-# NOT install any +cu / GPU wheel. The app auto-runs the light path on the Pi
-# (NCNN nano model, device=cpu, imgsz 320) -- see README_PI.md.
+# *** 64-bit OS required. The Pi has NO GPU -- torch MUST be the CPU build. ***
+# Modern torch defaults to CUDA aarch64 wheels (nvidia-*, triton) that waste
+# gigabytes and don't work on a Pi. The --extra-index-url + ordering below force
+# the CPU build. The app runs the light path on the Pi (NCNN nano, cpu, imgsz 320).
 #
-# Install with: bash setup_pi.sh   (creates the venv + apt packages too)
+# Install with: bash setup_pi.sh
 
-ultralytics          # YOLO; pulls aarch64 CPU torch on ARM
-opencv-python        # camera + image ops (apt also needs libgl1, libglib2.0-0)
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+torch                # CPU build, forced by the index URL above -- install BEFORE ultralytics
+torchvision
+
+ultralytics          # YOLO (torch already satisfied above, so it won't pull CUDA)
+opencv-python-headless # camera + image ops without GUI/Qt libs (less crashy on headless Pi)
 numpy
 easyocr              # Read mode OCR (Nepali + English); downloads models on first use
-
-# --- offline voice control ---
 vosk                 # offline speech recognition (download a model -- see README_PI.md)
 sounddevice          # microphone capture for Vosk (apt needs portaudio19-dev)
-
-# --- optional ---
 piper-tts            # optional nicer offline TTS; espeak-ng (apt) is the default
 gpiozero             # optional: physical GPIO button to trigger modes
 python-dotenv        # loads GEMINI_API_KEY from .env (only if you want online Describe)
-
-# NOT required offline (online-only features). Install ONLY if you want them:
 #   google-genai     # online Describe (needs internet + GEMINI_API_KEY)
-#   gTTS             # online TTS (Nepali offline already works via espeak-ng)
+#   gTTS             # online TTS
