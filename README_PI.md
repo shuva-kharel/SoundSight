@@ -52,8 +52,19 @@ speaker-test -t sine -f 440 -l 1 # quick check; espeak-ng "hello" should be audi
 python pi_app.py --selftest      # PASS/FAIL: camera frame, NCNN model+infer, audio, temp
 python pi_app.py --diag-imports  # if startup segfaults: isolate cv2/torch/ultralytics
 python pi_app.py --list-cameras  # which index your webcam is on (0/1/2…)
-python pi_app.py                 # run. Ctrl+C to stop.
+python pi_app.py --camera-index 1 # run with the working camera index. Ctrl+C to stop.
 ```
+If `--diag-imports` shows `torch` segfaulting, run laptop-offload mode instead:
+```bash
+# laptop
+python server.py --lan
+
+# Raspberry Pi
+python pi_app.py --find-server --camera-index 1
+```
+In this mode the Pi uses its camera and speaker, but sends detection to the laptop
+and does not import Torch/Ultralytics on the Pi.
+
 Camera open is OS-aware (V4L2 + MJPG on the Pi), tries indices 0/1/2, validates a real
 frame, warms up, and auto-reopens a yanked/frozen cam. Voice: say **"hey sight …"**.
 

@@ -106,4 +106,6 @@ def list_cameras(max_index=4):
         else:
             print(f"  index {i}: no frame")
     print("Found working camera(s): " + (", ".join(map(str, found)) if found else "NONE"))
+    if found:
+        print(f"Use one directly with: python pi_app.py --camera-index {found[0]}")
     return found

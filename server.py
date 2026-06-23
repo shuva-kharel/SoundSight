@@ -488,7 +488,8 @@ async def remote_detect(file: UploadFile = File(...)):
     dets = await run_in_threadpool(vision.detect, enhanced, False)
     return {"detections": [
         {"label": d["label"], "confidence": d["confidence"], "box": d["box"],
-         "urgency": d.get("urgency"), "area_ratio": d.get("area_ratio")} for d in dets]}
+         "urgency": d.get("urgency"), "area_ratio": d.get("area_ratio"),
+         "cx": d.get("cx"), "cy": d.get("cy")} for d in dets]}
 
 
 @app.post("/sos")

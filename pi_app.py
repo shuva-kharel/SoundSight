@@ -26,6 +26,7 @@ import faulthandler
 import importlib
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -68,6 +69,18 @@ def _import_vision_core():
 def _import_commands():
     return _import_module("commands")
 
+
+def find_espeak_local():
+    """Find espeak-ng without importing vision_core/torch."""
+    exe = shutil.which("espeak-ng") or shutil.which("espeak")
+    if exe:
+        return exe
+    for path in ("/usr/bin/espeak-ng", "/usr/local/bin/espeak-ng"):
+        if os.path.exists(path):
+            return path
+    return None
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-7s %(name)s: %(message)s",
@@ -106,11 +119,7 @@ class Speaker:
                         "(install with: sudo apt install espeak-ng)")
 
     def _find_espeak(self):
-        try:
-            return _import_module("vision_core").find_espeak()
-        except Exception as exc:
-            log.warning("Offline TTS unavailable: %s", exc)
-            return None
+        return find_espeak_local()
 
     def speak(self, text, voice="en"):
         if not text:
@@ -216,6 +225,21 @@ def soc_temp_c():
             return int(fh.read().strip()) / 1000.0
     except (OSError, ValueError):
         return None
+
+
+def env_camera_index():
+    value = os.environ.get("CAMERA_INDEX")
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        log.warning("Ignoring invalid CAMERA_INDEX=%r; expected an integer.", value)
+        return None
+
+
+def camera_indices(camera_index):
+    return (camera_index,) if camera_index is not None else (0, 1, 2)
 
 
 def _build_dispatch(speaker, banknote, crossing_mon, mtally, shared, fq, remote):
@@ -332,7 +356,7 @@ def _build_dispatch(speaker, banknote, crossing_mon, mtally, shared, fq, remote)
     return on_command
 
 
-def run(server_url=None):
+def run(server_url=None, camera_index=None):
     # Import the Pi-only dependencies lazily so startup errors are reported cleanly.
     cam = _import_camera()
     fq = _import_frame_quality()
@@ -370,7 +394,8 @@ def run(server_url=None):
         log.info("Pi voice control DISABLED (VOICE_ENABLED=False). "
                  "Install vosk+sounddevice+a model and set VOICE_ENABLED=True to enable.")
 
-    cap, cam_index, backend = cam.find_camera()   # OS-aware, validated open
+    indices = camera_indices(camera_index)
+    cap, cam_index, backend = cam.find_camera(indices)   # OS-aware, validated open
     if cap is None:
         log.error("No camera found. Try `python pi_app.py --list-cameras` to locate it.")
         return
@@ -396,7 +421,7 @@ def run(server_url=None):
                     if fails >= CAM_FAIL_LIMIT:
                         cap.release()
                         time.sleep(1.0)   # back off so we don't spin on a dead device
-                        newcap, cam_index, backend = cam.find_camera()
+                        newcap, cam_index, backend = cam.find_camera(indices)
                         if newcap is not None:
                             cap = newcap
                             fails = 0
@@ -476,13 +501,132 @@ def run(server_url=None):
         cap.release()
 
 
-def selftest():
+def _zone_from_det(det, frame_w):
+    cx = det.get("cx")
+    if cx is None:
+        box = det.get("box") or [0, 0, 0, 0]
+        cx = (float(box[0]) + float(box[2])) / 2.0
+    if cx < frame_w / 3:
+        return "on your left"
+    if cx > 2 * frame_w / 3:
+        return "on your right"
+    return "ahead"
+
+
+def _closeness(det):
+    urgency = det.get("urgency")
+    if urgency:
+        return urgency
+    area = float(det.get("area_ratio") or 0.0)
+    if area > 0.20:
+        return "very close"
+    if area >= 0.05:
+        return "near"
+    return "far"
+
+
+class RemoteAnnouncementManager:
+    """Tiny Torch-free announcer for laptop-offloaded detections."""
+
+    def __init__(self, min_gap=1.2, refresh=6.0):
+        self.min_gap = min_gap
+        self.refresh = refresh
+        self.last_spoken = 0.0
+        self.memory = {}
+
+    def choose(self, detections, frame_w, now):
+        if not detections or (now - self.last_spoken) < self.min_gap:
+            return None
+        ranked = sorted(
+            detections,
+            key=lambda d: (
+                _closeness(d) == "very close",
+                float(d.get("area_ratio") or 0.0),
+                float(d.get("confidence") or 0.0),
+            ),
+            reverse=True,
+        )
+        for det in ranked[:5]:
+            label = str(det.get("label") or "object")
+            zone = _zone_from_det(det, frame_w)
+            close = _closeness(det)
+            state = (zone, close)
+            prev_state, prev_t = self.memory.get(label, (None, 0.0))
+            if state != prev_state or close == "very close" or (now - prev_t) >= self.refresh:
+                self.memory[label] = (state, now)
+                self.last_spoken = now
+                if close == "far":
+                    return f"{label} {zone}"
+                return f"{label} {zone}, {close}"
+        return None
+
+
+def run_remote_only(server_url=None, camera_index=None):
+    """Torch-free Pi mode: camera on the Pi, detection on the laptop server."""
+    cam = _import_camera()
+    fq = _import_frame_quality()
+    remote_mod = _import_remote()
+
+    speaker = Speaker()
+    remote = remote_mod.RemoteCompute(server_url)
+    if not remote.enabled:
+        log.error("Remote-only mode needs COMPUTE_SERVER_URL or --find-server.")
+        return 2
+    log.info("REMOTE-ONLY mode: camera/audio on Pi, AI detection on %s", remote.url)
+    if not remote.health(force=True):
+        log.error("Laptop compute server is offline: %s", remote.url)
+        return 2
+
+    cap, cam_index, backend = cam.find_camera(camera_indices(camera_index))
+    if cap is None:
+        log.error("No camera found. Try `python pi_app.py --list-cameras`.")
+        return 2
+    log.info("SoundSight Pi remote-only running on camera %d (%s). Ctrl+C to stop.", cam_index, backend)
+
+    manager = RemoteAnnouncementManager()
+    offline_spoken = False
+    try:
+        while True:
+            t0 = time.time()
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                time.sleep(0.1)
+                continue
+
+            assess = fq.assess(frame)
+            if assess.get("reason") in ("too_dark", "no_frame"):
+                time.sleep(0.1)
+                continue
+
+            result = remote.detect(frame)
+            if result is None:
+                if not offline_spoken:
+                    speaker.speak("Laptop is offline")
+                    offline_spoken = True
+                time.sleep(1.0)
+                continue
+            offline_spoken = False
+
+            detections = result.get("detections") or []
+            msg = manager.choose(detections, frame.shape[1], time.time())
+            if msg:
+                speaker.speak(msg)
+
+            dt = time.time() - t0
+            if dt < FRAME_INTERVAL:
+                time.sleep(FRAME_INTERVAL - dt)
+    except KeyboardInterrupt:
+        log.info("Stopping.")
+    finally:
+        cap.release()
+    return 0
+
+
+def selftest(camera_index=None):
     """PASS/FAIL report: camera opens + returns a real frame, model loads + runs one
     inference, and audio (espeak-ng) is available. Exits 0 if all pass."""
     cam = _import_camera()
     remote_mod = _import_remote()
-    vc = _import_vision_core()
-    from vision_core import VisionCore, find_espeak
 
     print("\n==================  SoundSight Pi self-test  ==================")
     results = []
@@ -495,7 +639,7 @@ def selftest():
         results.append(ok)
         print(f"  [{'PASS' if ok else 'FAIL'}]  {name:20} {detail}")
 
-    cap, cam_index, backend = cam.find_camera()
+    cap, cam_index, backend = cam.find_camera(camera_indices(camera_index))
 
     def cam_check():
         if cap is None:
@@ -504,18 +648,31 @@ def selftest():
 
     check("camera", cam_check)
 
-    vision_holder = {}
-
     def model_check():
-        vision_holder["v"] = VisionCore(mode="coco-ncnn", accuracy="fast")
-        import numpy as _np
-        dets = vision_holder["v"].detect((_np.random.rand(240, 320, 3) * 255).astype("uint8"))
-        return len(dets) >= 0, f"inference ran (imgsz={vision_holder['v'].imgsz})"
+        code = (
+            "from vision_core import VisionCore\n"
+            "import numpy as np\n"
+            "v = VisionCore(mode='coco-ncnn', accuracy='fast')\n"
+            "dets = v.detect((np.random.rand(240, 320, 3) * 255).astype('uint8'))\n"
+            "print(f'inference ran (imgsz={v.imgsz}, dets={len(dets)})')\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-X", "faulthandler", "-c", code],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+        )
+        detail = (proc.stdout or proc.stderr or "").strip().splitlines()
+        detail = detail[-1] if detail else f"exit={proc.returncode}"
+        if proc.returncode == -11:
+            detail = "torch segfaulted on import; use remote-only mode or rebuild venv with a supported torch/python"
+        return proc.returncode == 0, detail
 
     check("model load + infer", model_check)
     check("audio (espeak-ng)", lambda: (
-        bool(find_espeak()),
-        find_espeak() or "MISSING -- sudo apt install espeak-ng (Pi) / winget (Windows)"))
+        bool(find_espeak_local()),
+        find_espeak_local() or "MISSING -- sudo apt install espeak-ng"))
 
     def remote_check():
         rc = remote_mod.RemoteCompute()
@@ -573,14 +730,29 @@ def diag_imports():
     raise SystemExit(1 if failed else 0)
 
 
+def torch_import_ok():
+    proc = subprocess.run(
+        [sys.executable, "-X", "faulthandler", "-c", "import torch; print(torch.__version__)"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=60,
+    )
+    return proc.returncode == 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="SoundSight Raspberry Pi entrypoint")
     ap.add_argument("--selftest", action="store_true",
                     help="check camera/model/audio/offload and exit with a PASS/FAIL report")
     ap.add_argument("--diag-imports", action="store_true",
                     help="isolate native import crashes for cv2/torch/ultralytics")
+    ap.add_argument("--remote-only", action="store_true",
+                    help="Torch-free mode: use the laptop compute server for detection")
     ap.add_argument("--list-cameras", action="store_true",
                     help="probe camera indices 0-4 (OS-aware backend) and exit")
+    ap.add_argument("--camera-index", type=int, default=env_camera_index(),
+                    help="open this camera index directly, e.g. 1 from --list-cameras")
     ap.add_argument("--find-server", action="store_true",
                     help="scan the LAN for the laptop compute server, then run using it")
     args = ap.parse_args()
@@ -590,7 +762,7 @@ def main():
         cam = _import_camera()
         cam.list_cameras()
     elif args.selftest:
-        selftest()
+        selftest(args.camera_index)
     else:
         server_url = None
         if args.find_server:
@@ -600,7 +772,14 @@ def main():
                 log.info("Using compute server: %s", server_url)
             else:
                 log.warning("No compute server found -- running on-device.")
-        run(server_url)
+        if args.remote_only or server_url or os.environ.get("COMPUTE_SERVER_URL"):
+            raise SystemExit(run_remote_only(server_url, args.camera_index))
+        if not torch_import_ok():
+            log.error("Torch crashes on this Pi Python environment, so local AI mode cannot start.")
+            log.error("Start the laptop with `python server.py --lan`, then run the Pi with `python pi_app.py --find-server`.")
+            log.error("For on-device mode, rebuild the Pi venv with a Python/Torch combination that imports cleanly.")
+            raise SystemExit(1)
+        run(server_url, args.camera_index)
 
 
 if __name__ == "__main__":
