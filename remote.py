@@ -20,10 +20,27 @@ import json
 import logging
 import os
 import socket
+import ssl
 import time
 import urllib.request
 
 log = logging.getLogger("soundsight.remote")
+
+# The laptop serves the LAN over HTTPS with a SELF-SIGNED cert (so browsers on the
+# LAN get a secure context for the camera). The Pi trusts it explicitly -- it's our
+# own laptop on our own LAN -- so verification is disabled for https URLs only.
+_UNVERIFIED_SSL = ssl.create_default_context()
+_UNVERIFIED_SSL.check_hostname = False
+_UNVERIFIED_SSL.verify_mode = ssl.CERT_NONE
+
+
+def _urlopen(req, timeout):
+    """urllib.request.urlopen that accepts the laptop's self-signed cert for https
+    URLs (and is a no-op wrapper for plain http)."""
+    url = req.full_url if isinstance(req, urllib.request.Request) else req
+    if url.startswith("https"):
+        return urllib.request.urlopen(req, timeout=timeout, context=_UNVERIFIED_SSL)
+    return urllib.request.urlopen(req, timeout=timeout)
 
 # --- config (env-overridable so you don't edit code at the venue) ----------- #
 COMPUTE_SERVER_URL = os.environ.get("COMPUTE_SERVER_URL", "")  # e.g. http://192.168.1.50:8000
@@ -85,7 +102,7 @@ class RemoteCompute:
             return self.online
         self._last_check = now
         try:
-            with urllib.request.urlopen(self.url + "/remote/health", timeout=1.5) as r:
+            with _urlopen(self.url + "/remote/health", timeout=1.5) as r:
                 info = json.loads(r.read())
             was = self.online
             self.online = bool(info.get("ok"))
@@ -102,7 +119,7 @@ class RemoteCompute:
         body, ctype = _multipart(fields, files)
         req = urllib.request.Request(self.url + path, data=body, headers={"Content-Type": ctype})
         t0 = time.time()
-        with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
+        with _urlopen(req, timeout=timeout or self.timeout) as r:
             data = json.loads(r.read())
         log.info("remote %s ok in %.0f ms", path, (time.time() - t0) * 1000)
         return data
@@ -111,7 +128,7 @@ class RemoteCompute:
         body, ctype = _multipart(fields, files)
         req = urllib.request.Request(self.url + path, data=body, headers={"Content-Type": ctype})
         t0 = time.time()
-        with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
+        with _urlopen(req, timeout=timeout or self.timeout) as r:
             txt = r.read().decode("utf-8", "ignore")
         log.info("remote %s ok in %.0f ms", path, (time.time() - t0) * 1000)
         return txt
@@ -159,12 +176,16 @@ class RemoteCompute:
 
 
 def _probe(ip, port, timeout):
-    try:
-        with urllib.request.urlopen(f"http://{ip}:{port}/remote/health", timeout=timeout) as r:
-            if json.loads(r.read()).get("ok"):
-                return f"http://{ip}:{port}"
-    except Exception:
-        pass
+    # Prefer HTTPS (what the laptop serves by default in --lan mode), fall back to
+    # plain HTTP for a server started with `--lan --http`.
+    for scheme in ("https", "http"):
+        url = f"{scheme}://{ip}:{port}"
+        try:
+            with _urlopen(url + "/remote/health", timeout=timeout) as r:
+                if json.loads(r.read()).get("ok"):
+                    return url
+        except Exception:
+            continue
     return None
 
 

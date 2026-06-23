@@ -93,6 +93,10 @@ python server.py                    # then open https://localhost:8000
 On first visit the self-signed cert shows a warning → **Advanced → Proceed to localhost**.
 Allow camera access, then press **7** (or 🎙️ Assistant) for hands-free, or **1** to Navigate.
 
+**Open it from another device (phone/tablet)?** Run `python server.py --lan-web` instead
+— it serves HTTPS on your LAN IP so the browser can use the camera (`getUserMedia` needs
+a secure context). Then open `https://<laptop-ip>:8000` and accept the cert warning once.
+
 Verify everything first:
 ```bash
 python server.py --selftest         # PASS/FAIL: models, OCR, TTS, Faces, Gemini key

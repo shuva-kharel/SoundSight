@@ -620,17 +620,34 @@ CERT_FILE = HERE / "cert.pem"
 KEY_FILE = HERE / "key.pem"
 
 
-def ensure_self_signed_cert():
-    """
-    Create a self-signed cert for localhost if one doesn't exist yet.
+def _cert_covers_ips(want_ips):
+    """True if the existing cert already lists every IP in want_ips in its SAN, so
+    we don't needlessly regenerate it. Returns False if the cert is missing/unreadable."""
+    if not (CERT_FILE.exists() and KEY_FILE.exists()):
+        return False
+    try:
+        from cryptography import x509
+        cert = x509.load_pem_x509_certificate(CERT_FILE.read_bytes())
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        have = {str(ip) for ip in san.get_values_for_type(x509.IPAddress)}
+        return all(ip in have for ip in want_ips)
+    except Exception:
+        return False
 
-    Why HTTPS at all? getUserMedia works on plain http://localhost, BUT modern
-    browsers (Chrome HTTPS-First, HSTS, etc.) often auto-upgrade localhost to
-    https://. When that hits a plain-HTTP server you get ERR_SSL_PROTOCOL_ERROR.
-    Serving real HTTPS sidesteps the browser entirely. The cert is self-signed,
-    so you'll click through a one-time "your connection is not private" warning.
+
+def ensure_self_signed_cert(extra_ips=None):
     """
-    if CERT_FILE.exists() and KEY_FILE.exists():
+    Create a self-signed cert covering localhost (+ any extra LAN IPs) if one doesn't
+    exist yet, or regenerate it if a needed LAN IP isn't already in the cert's SAN.
+
+    Why HTTPS at all? getUserMedia (camera/mic) only runs in a *secure context*:
+    https://, or http://localhost. A browser on another device (phone, the Pi)
+    hitting http://<laptop-lan-ip>:8000 is NOT secure, so the camera is blocked.
+    Serving HTTPS -- with the LAN IP in the cert's SAN -- makes that a secure context.
+    The cert is self-signed, so you'll click through a one-time "not private" warning.
+    """
+    want_ips = ["127.0.0.1"] + list(extra_ips or [])
+    if _cert_covers_ips(want_ips):
         return
 
     from cryptography import x509
@@ -638,10 +655,17 @@ def ensure_self_signed_cert():
     from cryptography.hazmat.primitives.asymmetric import rsa
     from cryptography.x509.oid import NameOID
 
-    log.info("Generating self-signed certificate (cert.pem / key.pem)...")
+    log.info("Generating self-signed certificate for %s (cert.pem / key.pem)...",
+             ", ".join(["localhost"] + want_ips))
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
     now = datetime.datetime.now(datetime.timezone.utc)
+    sans = [x509.DNSName("localhost")]
+    for ip in want_ips:
+        try:
+            sans.append(x509.IPAddress(ipaddress.ip_address(ip)))
+        except ValueError:
+            log.warning("Skipping invalid IP for cert SAN: %r", ip)
     cert = (
         x509.CertificateBuilder()
         .subject_name(name)
@@ -650,12 +674,7 @@ def ensure_self_signed_cert():
         .serial_number(x509.random_serial_number())
         .not_valid_before(now - datetime.timedelta(days=1))
         .not_valid_after(now + datetime.timedelta(days=825))
-        .add_extension(
-            x509.SubjectAlternativeName(
-                [x509.DNSName("localhost"), x509.IPAddress(ipaddress.IPv4Address("127.0.0.1"))]
-            ),
-            critical=False,
-        )
+        .add_extension(x509.SubjectAlternativeName(sans), critical=False)
         .sign(key, hashes.SHA256())
     )
     KEY_FILE.write_bytes(
@@ -724,21 +743,43 @@ if __name__ == "__main__":
     parser.add_argument(
         "--lan",
         action="store_true",
-        help="COMPUTE SERVER mode: bind 0.0.0.0 so the Pi can offload to this laptop "
-             "over the LAN (implies --http; prints this machine's LAN IP)",
+        help="COMPUTE SERVER mode: bind 0.0.0.0 (plain HTTP) so the Pi can offload to this "
+             "laptop over the LAN -- fast, no per-frame TLS. Prints this machine's LAN IP.",
+    )
+    parser.add_argument(
+        "--lan-web",
+        action="store_true",
+        help="LAN WEB mode: serve the browser app over HTTPS on 0.0.0.0 so a browser on "
+             "another device (phone/Pi) can use its camera (getUserMedia needs HTTPS).",
     )
     args = parser.parse_args()
 
     if args.selftest:
         run_selftest()
 
-    # COMPUTE-SERVER mode: serve plain HTTP on all interfaces so the Pi can reach it.
-    if args.lan:
+    # LAN-WEB mode: serve the browser app over HTTPS on all interfaces so a browser
+    # on ANOTHER device (phone, the Pi) gets a *secure context* and getUserMedia
+    # (camera) works. Plain http:// from a non-localhost address can't open the camera.
+    if args.lan_web:
+        from remote import local_ip
+        ip = local_ip() or "<this-laptop-ip>"
+        ensure_self_signed_cert(extra_ips=[ip] if ip != "<this-laptop-ip>" else None)
+        log.info("LAN WEB (profile=%s) on https://0.0.0.0:8000", FEATURE_PROFILE)
+        log.info("Open the web app from any device:  https://%s:8000", ip)
+        log.info("  (first visit: accept the self-signed cert warning -- it's your own laptop)")
+        log.info("The Pi can also offload here:  export COMPUTE_SERVER_URL=https://%s:8000", ip)
+        uvicorn.run(app, host="0.0.0.0", port=8000,
+                    ssl_keyfile=str(KEY_FILE), ssl_certfile=str(CERT_FILE))
+    # COMPUTE-SERVER mode: plain HTTP on all interfaces. Fast (no per-frame TLS
+    # handshake) for the Pi's real-time /remote/detect offload loop. Not for browsers
+    # on other devices -- they can't use the camera over plain http (use --lan-web).
+    elif args.lan:
         from remote import local_ip
         ip = local_ip() or "<this-laptop-ip>"
         log.info("COMPUTE SERVER (profile=%s) on http://0.0.0.0:8000", FEATURE_PROFILE)
         log.info("Point the Pi at it:  export COMPUTE_SERVER_URL=http://%s:8000", ip)
         log.info("(or run `python pi_app.py --find-server` on the Pi to auto-detect)")
+        log.info("For the browser web app on another device, use:  python server.py --lan-web (HTTPS)")
         uvicorn.run(app, host="0.0.0.0", port=8000)
     # Bind to localhost so the browser treats it as a secure context (getUserMedia).
     elif args.http:

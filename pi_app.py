@@ -670,6 +670,8 @@ def selftest(camera_index=None):
             detail = "torch segfaulted on import; use remote-only mode or rebuild venv with a supported torch/python"
         elif "null bytes" in err:
             detail = "corrupted venv file (NUL bytes) -- run: python pi_app.py --repair-venv"
+        elif proc.returncode == -6 or "double-linked list" in err or "Aborted" in err:
+            detail = "native abort in torch/torchvision -- run: python pi_app.py --reinstall-ml"
         return proc.returncode == 0, detail
 
     check("model load + infer", model_check)
@@ -768,27 +770,41 @@ def _site_packages_dirs():
     return [d for d in dirs if os.path.isdir(d)]
 
 
-def _import_to_distribution():
-    """Map a top-level import name (e.g. 'cv2') to its pip distribution name
-    (e.g. 'opencv-python-headless') so we reinstall the right thing."""
+def _file_owner_map():
+    """Reverse map: absolute file path -> the pip distribution that installed it,
+    built from each installed package's RECORD (its own list of files). This is
+    authoritative -- it correctly attributes isympy.py -> sympy and cv2/* ->
+    opencv-python-headless -- unlike guessing a package name from the filename
+    (which could send pip after a random unrelated PyPI package)."""
+    owners = {}
     try:
         from importlib import metadata
-        mapping = {}
-        for top, dists in metadata.packages_distributions().items():
-            # Corrupted .dist-info can yield empty/None entries -- keep only real names.
-            names = [d for d in (dists or []) if d]
-            if names:
-                mapping[top] = names[0]
-        return mapping
     except Exception:
-        return {}
+        return owners
+    for dist in metadata.distributions():
+        try:
+            name = (dist.metadata["Name"] or "").strip()
+        except Exception:
+            name = ""
+        if not name:
+            continue
+        for f in (dist.files or []):
+            try:
+                p = os.path.normcase(os.path.realpath(dist.locate_file(f)))
+            except Exception:
+                continue
+            owners[p] = name
+    return owners
 
 
 def scan_corrupt_files():
     """Walk site-packages for .py files containing NUL bytes (the corruption
-    signature). Returns {distribution_name: [sample_paths...]}."""
-    import_to_dist = _import_to_distribution()
+    signature). Returns (corrupt, unowned):
+      corrupt  = {distribution_name: [paths...]}   -- reinstallable via pip
+      unowned  = [paths...]                         -- stray files no package owns"""
+    owners = _file_owner_map()
     corrupt = {}
+    unowned = []
     for sp in _site_packages_dirs():
         for root, _dirs, files in os.walk(sp):
             for fn in files:
@@ -802,14 +818,13 @@ def scan_corrupt_files():
                     continue
                 if b"\x00" not in data:
                     continue
-                rel = os.path.relpath(path, sp)
-                top = rel.split(os.sep)[0]
-                top = top[:-3] if top.endswith(".py") else top
-                # Fall back to the import name if the distribution can't be resolved
-                # (`or top` guards against a None value from broken metadata).
-                dist = import_to_dist.get(top) or top
-                corrupt.setdefault(dist, []).append(path)
-    return corrupt
+                key = os.path.normcase(os.path.realpath(path))
+                dist = owners.get(key)
+                if dist:
+                    corrupt.setdefault(dist, []).append(path)
+                else:
+                    unowned.append(path)
+    return corrupt, unowned
 
 
 def repair_venv(apply=False):
@@ -818,8 +833,8 @@ def repair_venv(apply=False):
     only report. Exits 0 if the venv is clean (or was repaired)."""
     print("\n================ SoundSight venv corruption scan ================")
     print("Scanning site-packages for files with NUL bytes (interrupted install / bad SD card)...")
-    corrupt = scan_corrupt_files()
-    if not corrupt:
+    corrupt, unowned = scan_corrupt_files()
+    if not corrupt and not unowned:
         print("  [OK] No corrupted .py files found.")
         ok, err = torch_import_ok()
         if ok:
@@ -833,39 +848,174 @@ def repair_venv(apply=False):
         raise SystemExit(0 if ok else 1)
 
     dists = sorted(corrupt)
-    print(f"  [!] Corrupted packages found: {', '.join(dists)}")
-    for dist, paths in corrupt.items():
-        print(f"      - {dist}: {len(paths)} file(s), e.g. {paths[0]}")
+    total_bad = sum(len(v) for v in corrupt.values()) + len(unowned)
+    if dists:
+        print(f"  [!] Corrupted packages found: {', '.join(dists)}")
+        for dist, paths in sorted(corrupt.items()):
+            print(f"      - {dist}: {len(paths)} file(s), e.g. {paths[0]}")
+    if unowned:
+        print(f"  [!] {len(unowned)} corrupted file(s) belong to no installed package (stray):")
+        for p in unowned[:10]:
+            print(f"      - {p}")
+        if len(unowned) > 10:
+            print(f"      ... and {len(unowned) - 10} more")
+
+    # A handful of corrupt files = interrupted install (repairable). Hundreds across
+    # many packages = the filesystem/SD card is rotting; reinstalling won't hold.
+    widespread = total_bad >= 200 or len(dists) >= 8
 
     if not apply:
         print("\n  Re-run with --repair-venv to reinstall these packages, or manually:")
-        print(f"    pip install --force-reinstall --no-cache-dir {' '.join(dists)}")
+        if dists:
+            print(f"    pip install --force-reinstall --no-cache-dir {' '.join(dists)}")
+        if widespread:
+            print("  NOTE: corruption is widespread -- if it returns after repair, the SD card")
+            print("        is failing; reflash a fresh card and run `bash setup_pi.sh`.")
         print("=================================================================")
         raise SystemExit(1)
 
     # Reinstall via the SAME interpreter's pip so we hit this venv, not system pip.
-    cmd = [sys.executable, "-m", "pip", "install",
-           "--force-reinstall", "--no-cache-dir"] + dists
-    print("\n  Repairing:", " ".join(cmd))
-    rc = subprocess.run(cmd).returncode
-    if rc != 0:
-        print("  [FAIL] pip reinstall failed (exit %d). Check network / disk space." % rc)
-        print("=================================================================")
-        raise SystemExit(rc)
+    # Only reinstall real distributions -- never guess a package for a stray file.
+    if dists:
+        cmd = [sys.executable, "-m", "pip", "install",
+               "--force-reinstall", "--no-cache-dir"] + dists
+        print("\n  Repairing:", " ".join(cmd))
+        rc = subprocess.run(cmd).returncode
+        if rc != 0:
+            print("  [FAIL] pip reinstall failed (exit %d)." % rc)
+            print("        Check network (the Pi must reach pypi.org / piwheels.org) and disk space,")
+            print("        then re-run. If only piwheels DNS fails, retrying usually works.")
+            print("=================================================================")
+            raise SystemExit(rc)
+    else:
+        print("\n  No reinstallable packages -- only stray files (see below).")
 
     # Verify the corruption is actually gone.
-    still_bad = scan_corrupt_files()
+    still_bad, still_unowned = scan_corrupt_files()
     ok, err = torch_import_ok()
     if still_bad:
         print("  [!] Still corrupted after reinstall:", ", ".join(sorted(still_bad)))
-        print("      The SD card may be failing. Re-run, or rebuild the venv (bash setup_pi.sh).")
+        print("      The SD card is likely failing. Reflash a fresh card and run `bash setup_pi.sh`.")
         print("=================================================================")
         raise SystemExit(1)
-    print("  [OK] No corrupted files remain.")
-    print("  [%s] `import torch` %s." % ("OK" if ok else "!!", "succeeds" if ok else "still fails:\n      " + err.strip()))
-    print("  Now run:  python pi_app.py --selftest")
+    if still_unowned:
+        print(f"  [!] {len(still_unowned)} stray corrupted file(s) remain (no package owns them).")
+        print("      These aren't imported by torch, but to be safe delete them, e.g.:")
+        print(f"        rm '{still_unowned[0]}'")
+    print("  [OK] No package-owned corrupted files remain.")
+    print("  [%s] `import torch` %s." % ("OK" if ok else "!!",
+          "succeeds" if ok else "still fails:\n      " + err.strip()))
+    if ok:
+        print("  Now run:  python pi_app.py --selftest")
     print("=================================================================")
     raise SystemExit(0 if ok else 1)
+
+
+# --------------------------------------------------------------------------- #
+# native ML-stack repair -- fix `corrupted double-linked list` / SIGABRT aborts
+# --------------------------------------------------------------------------- #
+# Symptom: torch IMPORTS fine, but the first inference aborts in a C/C++ op
+# (torchvision::nms, lap, ...) with "corrupted double-linked list" / "Aborted".
+# This is a broken or MISMATCHED native build -- usually a GPU/CUDA torch wheel on
+# the Pi (it must be the CPU build) or a torchvision compiled against a different
+# torch. The fix is a clean, matched CPU reinstall of torch + torchvision.
+
+def _run_py(code, timeout=120):
+    return subprocess.run(
+        [sys.executable, "-X", "faulthandler", "-c", code],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+
+
+def ml_stack_info():
+    """Return (text, cuda_build): torch/torchvision/numpy versions and whether torch
+    is a CUDA build (it should be None / CPU on a Pi)."""
+    proc = _run_py(
+        "import torch, torchvision, numpy\n"
+        "print('torch', torch.__version__)\n"
+        "print('torchvision', torchvision.__version__)\n"
+        "print('numpy', numpy.__version__)\n"
+        "print('cuda_build', torch.version.cuda)\n",
+        timeout=60)
+    out = (proc.stdout or "").strip()
+    cuda_build = None
+    for line in out.splitlines():
+        if line.startswith("cuda_build "):
+            val = line.split(" ", 1)[1].strip()
+            cuda_build = None if val in ("None", "") else val
+    return (out or (proc.stderr or "").strip()), cuda_build
+
+
+def nms_ok():
+    """Run the exact native op that aborts (torchvision NMS) in a child process.
+    Returns (ok, detail). returncode -6 == SIGABRT (the 'corrupted double-linked
+    list' crash)."""
+    proc = _run_py(
+        "import torch, torchvision\n"
+        "b = torch.tensor([[0.,0.,10.,10.],[1.,1.,11.,11.]])\n"
+        "s = torch.tensor([0.9, 0.8])\n"
+        "keep = torchvision.ops.nms(b, s, 0.5)\n"
+        "print('nms ok', keep.tolist())\n",
+        timeout=60)
+    if proc.returncode == 0:
+        return True, (proc.stdout or "").strip().splitlines()[-1]
+    if proc.returncode == -6:
+        return False, "SIGABRT (corrupted double-linked list) -- native torch/torchvision build is broken"
+    tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+    return False, (tail[-1] if tail else f"exit={proc.returncode}")
+
+
+def reinstall_ml(apply=False):
+    """Diagnose and (if apply) cleanly reinstall a matched CPU torch + torchvision so
+    native inference stops aborting. --reinstall-ml to fix; the check runs first."""
+    print("\n============== SoundSight native ML-stack check ==============")
+    info, cuda_build = ml_stack_info()
+    print(info.replace("\n", "\n  ") if info else "  (could not read torch versions)")
+    if cuda_build is not None:
+        print(f"  [!] torch is a CUDA/GPU build (cuda={cuda_build}). The Pi has NO GPU --")
+        print("      it MUST run the CPU build. This is the usual cause of the abort.")
+    ok, detail = nms_ok()
+    print(f"  [{'PASS' if ok else 'FAIL'}] torchvision NMS: {detail}")
+
+    if ok and cuda_build is None:
+        print("  Native stack looks healthy. If inference still aborts, run --selftest.")
+        print("=============================================================")
+        raise SystemExit(0)
+
+    # Force the CPU wheels from PyTorch's CPU index (matched torch+torchvision pair).
+    cmd = [sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-cache-dir",
+           "--extra-index-url", "https://download.pytorch.org/whl/cpu", "torch", "torchvision"]
+    if not apply:
+        print("\n  Re-run with --reinstall-ml to fix, or do it manually:")
+        print("   ", " ".join(cmd))
+        print("=============================================================")
+        raise SystemExit(1)
+
+    print("\n  Reinstalling CPU torch + torchvision:\n   ", " ".join(cmd))
+    rc = subprocess.run(cmd).returncode
+    if rc != 0:
+        print("  [FAIL] pip reinstall failed (exit %d). Check network / disk space." % rc)
+        print("=============================================================")
+        raise SystemExit(rc)
+
+    info, cuda_build = ml_stack_info()
+    ok, detail = nms_ok()
+    print("\n  After reinstall:")
+    print(info.replace("\n", "\n  ") if info else "  (could not read torch versions)")
+    print(f"  [{'PASS' if ok else 'FAIL'}] torchvision NMS: {detail}")
+    if ok and cuda_build is None:
+        print("  [OK] Native stack fixed. Now run:  python pi_app.py --selftest")
+        print("=============================================================")
+        raise SystemExit(0)
+    # Still broken -- the CPU index didn't take (PyPI served a GPU wheel) or the SD
+    # card damaged a .so. Point at the most reliable ARM-CPU source (piwheels).
+    print("  [!] Still not healthy. Try the Raspberry-Pi CPU wheels from piwheels:")
+    print("      pip install --force-reinstall --no-cache-dir \\")
+    print("        --index-url https://www.piwheels.org/simple \\")
+    print("        --extra-index-url https://pypi.org/simple torch torchvision")
+    print("  If it still aborts after that, the SD card is failing -- reflash and re-setup.")
+    print("  MEANWHILE you can run detection on the laptop:  python pi_app.py --find-server")
+    print("=============================================================")
+    raise SystemExit(1)
 
 
 def main():
@@ -878,6 +1028,10 @@ def main():
                     help="scan the venv for NUL-corrupted files (cause of 'null bytes' errors) and report")
     ap.add_argument("--repair-venv", action="store_true",
                     help="scan AND force-reinstall any NUL-corrupted packages, then verify torch imports")
+    ap.add_argument("--check-ml", action="store_true",
+                    help="check the native torch/torchvision build (catches 'corrupted double-linked list' aborts)")
+    ap.add_argument("--reinstall-ml", action="store_true",
+                    help="reinstall a matched CPU torch+torchvision to fix native inference aborts, then verify")
     ap.add_argument("--remote-only", action="store_true",
                     help="Torch-free mode: use the laptop compute server for detection")
     ap.add_argument("--list-cameras", action="store_true",
@@ -893,6 +1047,10 @@ def main():
         repair_venv(apply=True)
     elif args.scan_corrupt:
         repair_venv(apply=False)
+    elif args.reinstall_ml:
+        reinstall_ml(apply=True)
+    elif args.check_ml:
+        reinstall_ml(apply=False)
     elif args.list_cameras:
         cam = _import_camera()
         cam.list_cameras()
