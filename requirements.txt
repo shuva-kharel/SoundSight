@@ -16,7 +16,9 @@ python-dotenv   # loads GEMINI_API_KEY etc. from a .env file in the project root
 # espeak-ng is a program, not a pip package: Windows `winget install eSpeak-NG.eSpeak-NG`,
 # Pi/Linux `sudo apt install espeak-ng`. English speech is the browser's Web Speech API.
 #
-# OPTIONAL (faces): pip install insightface onnxruntime  (best, GPU) OR  face_recognition
+# Faces (enabled on the laptop): InsightFace buffalo_l via onnxruntime.
+insightface     # known-face recognition (greet by name); pure-python wheel
+onnxruntime     # runs the InsightFace model (CPU). For GPU: onnxruntime-gpu (matching CUDA)
 # Note: MODEL_MODE="openvocab" (YOLO-World) also needs CLIP -- ultralytics
 # auto-installs it on first use, so it isn't pinned here.
 

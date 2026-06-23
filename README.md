@@ -1,333 +1,244 @@
 # 👁️ SoundSight
 
-A browser-testable, real-time visual assistant for blind users.
+A real-time, voice-driven **visual assistant for blind and low-vision users**. It watches
+through a camera and *talks* — describing what's ahead, reading text and labels, identifying
+and counting money, recognising traffic lights, greeting known faces, finding objects, and
+warning about hazards — in **English and Nepali**, hands-free.
 
-The **browser** owns the webcam (`getUserMedia`) and the voice (Web Speech API).
-The **Python backend** does all the AI (YOLO object detection + EasyOCR). They
-talk over a WebSocket. The vision/AI code lives in [`vision_core.py`](vision_core.py)
-with **no web code**, so it ports to a Raspberry Pi unchanged — the web layer in
-[`server.py`](server.py) is the only thing you replace on-device.
+It runs in two places that work together:
+
+- **Laptop (RTX 5060)** — the full app in your browser, *and* an optional **compute server**
+  that does the heavy AI on the GPU.
+- **Raspberry Pi 4** — a wearable that runs the light real-time loop locally and **offloads**
+  heavy on-demand tasks to the laptop over Wi-Fi (falling back to on-device models if the
+  laptop isn't reachable).
+
+> **Honest status:** see [FEATURES.md](FEATURES.md) for the exact, audited state of every
+> feature (working / partial / disabled-by-flag) and which device it runs on. This README
+> describes the design and how to run it.
+
+---
+
+## How it's put together
 
 ```
-browser ──(downscaled JPEG frames)──►  server.py  ──►  vision_core.py (YOLO)
-   ▲                                       │
-   └──────────(JSON: boxes + speak)────────┘
+            ┌──────────────────────────── LAPTOP (RTX 5060) ────────────────────────────┐
+ browser ◄──┤  server.py  (FastAPI)                                                      │
+ (camera,   │   • Navigate WebSocket  • Read/OCR  • Money  • Describe  • Faces  • Crossing │
+  Web       │   • HEAVY models (profile=laptop): yolo11m FP16, EasyOCR-GPU, InsightFace,  │
+  Speech)   │     Depth Anything V2, Gemini/Ollama VLM                                    │
+            │                                                                            │
+            │  server.py --lan  ► also a COMPUTE SERVER on the LAN: /remote/*            │
+            └───────────────▲────────────────────────────────────────────────────────────┘
+                            │  Wi-Fi (phone/laptop hotspot) — frames out, results back
+                            │  (remote.py; auto-falls back to on-device if unreachable)
+            ┌───────────────┴──────────────── RASPBERRY PI 4 ──────────────────────────┐
+            │  pi_app.py                                                                │
+            │   • USB camera (V4L2+MJPG)  • LIGHT local loop ALWAYS:                    │
+            │     yolo11n NCNN @320 (CPU) + ByteTrack + geometric distance + espeak-ng  │
+            │   • Navigate + hazards = 100% local (never network-dependent)             │
+            │   • Read / Money / Faces / Describe = OFFLOAD to the laptop, or on-device │
+            └───────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Modes
-- **Navigate** — streams frames, draws boxes, and speaks. It is **event-driven**:
-  it announces a thing **once** ("two people ahead", "chair on your left") and then
-  stays quiet — it only speaks again when something actually *changes* (see below),
-  so it never loops "caution, person nearby" at you.
+**The split is automatic** via `FEATURE_PROFILE` in [vision_core.py](vision_core.py):
+a machine with CUDA = **`laptop`** (heavy models); ARM / no-CUDA = **`pi`** (light models).
+No code edits to switch.
 
-### Detection pipeline
-Everything lives behind `VisionCore.detect_and_rank()` in
-[`vision_core.py`](vision_core.py):
-1. **Persistent tracking** — `model.track(persist=True, bytetrack)` gives every
-   object a stable `track_id` across frames (with `iou=0.5, agnostic_nms=True,
-   max_det=50`). Tracking removes single-frame false positives (a blip never earns
-   an id) and is what makes event-driven speech possible. Falls back to
-   `predict()` + `(label,zone)` keys if a model can't track.
-2. **Model** — `MODEL_MODE`: `"coco"` *(default, `.pt`)* · `"coco-ncnn"` *(Pi)* ·
-   `"openvocab"` (YOLO-World) · `"oiv7"`. Size via `MODEL_ACCURACY`:
-   `"fast"`=yolo11n (Pi/NCNN) · `"balanced"`=yolo11s (laptop default) ·
-   `"accurate"`=yolo11m (GPU). Bigger = more accurate, slower.
-3. **Detect everything** — `DETECT_ALL = True`: no allowlist drop; every class the
-   model knows (bottle, cup, chair, bag, phone…) is detected. `NAVIGATION_CLASSES`
-   only *prioritizes* ranking; `SYNONYMS` give nicer words and never remove a class.
-4. **Per-class confidence** — `DEFAULT_CONF = 0.35`; person/vehicles 0.40.
-5. **Geometry-only part removal** — a non-person box is dropped only if >70% inside
-   a larger person box **and** <30% of its area (glasses/face on a person). A
-   standalone bottle/cup/bag is never dropped.
-6. **Temporal smoothing** — secondary confirm at **2-of-3** frames (tracking already
-   stabilizes).
+---
 
-### Event-driven announcements (the anti-repeat core)
-`AnnouncementManager` keeps per-`track_id` memory and speaks **only on an event**:
-- **NEW** — a confirmed object/group not introduced yet.
-- **ESCALATION** — its urgency rose a tier (far→near→very close). De-escalation is
-  **silent**.
-- **ZONE CHANGE / COUNT** — it moved zones (held past a deadband) or a group gained a
-  member ("two people ahead").
-- **REFRESH** — after `REFRESH_SILENCE` (8 s) of silence, it restates the single most
-  important object so you're never left guessing.
+## Features
 
-A stable object that doesn't change is **never repeated**. **Hysteresis** deadbands
-(`ZONE_DEADBAND`, `URGENCY_MARGIN`) stop boundary/threshold flip-flop. Objects are
-**grouped + counted** with plurals; events are ranked **very-close hazards first**,
-capped at `MAX_PER_CYCLE` (2). Tune it all via the constants at the top of
-[`vision_core.py`](vision_core.py) (`REFRESH_SILENCE, ZONE_DEADBAND, URGENCY_MARGIN,
-MAX_PER_CYCLE, FORGET, MIN_GAP`). Every 15th frame the console logs `RAW`/`KEPT` +
-active `track_ids`; whenever it speaks it logs **why** (`[new]/[escalation]/[change]/
-[refresh]`).
-
-### Raspberry Pi
-[`pi_app.py`](pi_app.py) is the on-device entrypoint: it reads the Pi camera and
-speaks through **espeak-ng** (offline), running the same pipeline in `"coco-ncnn"`
-(NCNN nano on the ARM CPU). `python pi_app.py` — `sudo apt install espeak-ng` for
-audio. It exports the NCNN model once on first run.
-- **Read** — captures one full-res frame, runs **bilingual OCR (Nepali +
-  English)** via `POST /ocr` (returns `{text, lang}`), and speaks it. English is
-  spoken with the browser's Web Speech API; **Nepali** (Devanagari) goes to
-  `POST /tts`, which is **tiered** for the best quality: (1) a **pre-recorded file**
-  from `audio/ne/` for the fixed vocabulary (denominations, navigation, warnings —
-  best, offline); (2) **gTTS** for arbitrary OCR text (good, online); (3)
-  **espeak-ng** offline fallback (low quality, always works). Generate the
-  pre-recorded set once with `python gen_voice.py` (online), and edit the table in
-  [`nepali_phrases.py`](nepali_phrases.py). OCR'd Devanagari is normalized first.
-  Install espeak-ng: Windows `winget install eSpeak-NG.eSpeak-NG`, Pi/Linux
-  `sudo apt install espeak-ng`.
-- **Repeat** (key **4** or **R**) — re-speaks the last Read result without
-  re-capturing (handy if you missed it or want it slower to follow).
-- **Language** (key **5** or **L**) — cycles **Auto → English → नेपाली**. Auto
-  trusts the OCR's detected script; pick English or Nepali to force the voice when
-  auto-detection guesses wrong. Each press speaks a confirmation; then press
-  **Repeat** to re-hear the last text in the chosen language.
-- **Describe** — captures one frame, sends it to a vision-language model
-  (Google **Gemini**) via `POST /describe`, and speaks a short scene description.
-  Needs a `GEMINI_API_KEY` (see below). The provider is isolated in
-  `SceneDescriber.describe()` ([`vision_core.py`](vision_core.py)) — swap it for a
-  local VLM or another API without touching the server or browser.
-- **Money** (key **4** or **M**) — reads the held Nepali rupee note and says its
-  value ("Five hundred rupees" / "पाँच सय रुपैयाँ"). It will **never invent a
-  denomination** at a wall/hand: `BanknoteClassifier` ([`vision_core.py`](vision_core.py))
-  uses a quality pre-check, a central-ROI crop, a **confidence + margin gate**
-  (`MONEY_CONF` 0.85, `MONEY_MARGIN` 0.30), a **background → "no note"** class, and
-  the key fix — **temporal voting** over ~10 frames (`MONEY_VOTES`/`MONEY_MIN_AGREE`):
-  a value is announced only if it wins a clear majority, else *"no note detected"* /
-  *"couldn't read clearly, try again"*. The browser sends the frame burst to
-  `POST /money`. Train with [`train_banknote.py`](train_banknote.py) — **collect a
-  large, varied `background` (no-note) class** for the strongest rejection.
-
-### Proximity urgency (Navigate)
-Each detection's closeness is estimated from how much of the frame it fills,
-`area_ratio = box_area / frame_area`, and classified:
-
-| urgency | area_ratio | box color | speech |
+| Mode | What it does | Voice command | Where it runs |
 |---|---|---|---|
-| far | `< 0.05` | green | `"{label} {zone}"` |
-| near | `0.05 – 0.20` | yellow | `"{label} {zone}"` |
-| very close | `> 0.20` | red (thicker) | `"Careful, {label} {zone}, very close"` |
+| **Navigate** | Continuously detects people/objects/vehicles, tracks them, and speaks **event-driven** ("two people ahead", "chair on your left") — once, not on a loop. Hazards interrupt. | always on (key **1**) | Pi-local + laptop |
+| **Read** | OCR of signs/text (Nepali + English), with enhance/deskew/rotate-retry; refuses blurry junk. | "read this" (key **2**) | laptop / offload |
+| **Label reading** | On a Read, parses **expiry/MFG dates** (incl. **Bikram Sambat**), **dosage**, product name → "this expired 2 months ago". | "read the label" | laptop / offload |
+| **Describe** | One-sentence scene description via **Gemini** (online); offline → local **Ollama VLM** or a summary of current detections. | "what's in front" (key **3**) | laptop (Gemini=internet) |
+| **Money — identify** | Reads a held note ("Five hundred rupees") with a confidence+margin gate and **temporal voting** so it **never invents a value** at a wall/hand. | "how much" (key **4**) | Pi/laptop/offload |
+| **Money — count** | Sums **multiple** notes laid out in frame → "two 500s and one 100, total 1100". | "count the notes" | laptop/offload |
+| **Money — tally** | Running total across captures + change: "add this note", "total", "undo", "pay 500". | "add this note" / "total" | Pi/laptop |
+| **Crossing** | Classifies a traffic light's colour (HSV) with hysteresis + **fail-safe** wording ("green … *looks* clear, listen for vehicles"). | "can I cross" (key **C**) | Pi/laptop |
+| **Faces** | Greets enrolled people by name in Navigate; "who's here". Opt-in, local only. | "who's here" / "remember this person as Ram" | laptop / offload |
+| **Find** | Guides you to a detected object by direction + closeness. | "find a cup" | laptop |
+| **Distance** | Camera-only distance: geometric (known sizes) everywhere, **Depth Anything V2** fused to metres on the laptop. | (module; see FEATURES.md) | geom both · depth laptop |
+| **SOS** | Loud repeated emergency alert + location, works offline. | "help me" / "emergency" | laptop |
+| **TTS** | English = browser Web Speech; **Nepali** = pre-recorded clips → gTTS → espeak-ng (offline). | — | both |
+| **Voice control** | Wake word "hey sight", barge-in, live caption, one-at-a-time **priority speech** (hazards > answers > ambient), fuzzy bilingual parser. | toggle (key **7**) | laptop browser (Pi: Vosk, off by default) |
+| **DEMO mode** | Steps the hero sequence on cue so a live demo can't stall. | key **D** | laptop |
 
-- **Very-close** warnings bypass the normal cooldown (re-announced every **1s**),
-  are spoken **faster** (`rate 1.3`), and **interrupt** calmer speech.
-- An object whose `area_ratio` is **growing** frame-over-frame is flagged as
-  approaching: `"{label} {zone}, getting closer"`.
-- The approach test lives in one clean swap point —
-  `ApproachDetector.approaching_objects()` in [`vision_core.py`](vision_core.py).
-  On the Pi, replace its body with **ultrasonic-sensor** distance deltas; keep
-  the signature (detections in, set of `(label, zone)` keys out) and the rest of
-  the pipeline is unchanged.
+---
 
-## Setup & run
+## Quick start — Laptop (the full app)
 
 ```bash
-# 1. (recommended) create a virtual environment
+# 1. virtual environment
 python -m venv .venv
-.venv\Scripts\activate          # Windows PowerShell:  .venv\Scripts\Activate.ps1
+.venv\Scripts\Activate.ps1          # Windows;  Linux/mac: source .venv/bin/activate
 
-# 2. install dependencies
+# 2. dependencies
 pip install -r requirements.txt
 
-# 3. (optional) enable Describe mode -- add your Gemini API key
-#    Copy .env.example to .env and put your key in it:
-#        GEMINI_API_KEY=your-key-here
-#    Get a key at https://aistudio.google.com/apikey
+# 3. (optional) GPU build of PyTorch for an RTX 50-series (Blackwell) — see "GPU notes" below
 
-# 4. run the server
-python server.py
+# 4. (optional) Describe online — put your Gemini key in a .env file:
+#       GEMINI_API_KEY=your-key-here      (get one at https://aistudio.google.com/apikey)
+
+# 5. install espeak-ng (offline Nepali voice):  winget install eSpeak-NG.eSpeak-NG
+
+# 6. run
+python server.py                    # then open https://localhost:8000
 ```
 
-> **Describe mode** needs a `GEMINI_API_KEY`. The simplest way is a **`.env` file**
-> in the project root (the server auto-loads it on startup):
->
-> ```
-> GEMINI_API_KEY=your-key-here
-> ```
->
-> `.env` is git-ignored so your key isn't committed. (You can also set the env var
-> by hand instead: PowerShell `$env:GEMINI_API_KEY="..."`, bash
-> `export GEMINI_API_KEY="..."`.) Without a key, Navigate and Read still work;
-> Describe just says "set GEMINI_API_KEY and restart". The model defaults to
-> `gemini-2.5-flash` (change `DESCRIBE_MODEL` in [`vision_core.py`](vision_core.py)
-> to `gemini-3.5-flash` for richer descriptions).
+On first visit the self-signed cert shows a warning → **Advanced → Proceed to localhost**.
+Allow camera access, then press **7** (or 🎙️ Assistant) for hands-free, or **1** to Navigate.
 
-Then open **https://localhost:8000**. The cert is self-signed, so on the first
-visit click **Advanced → Proceed to localhost (unsafe)** — this is your own
-machine. Allow camera access, press **1** (or click **Navigate**), and within a
-second you should see boxes and hear *"person ahead"*.
-
-> **Why HTTPS?** `getUserMedia` works on plain `http://localhost`, but modern
-> browsers (Chrome's HTTPS-First mode, HSTS, etc.) auto-upgrade `localhost` to
-> `https://`. Hitting a plain-HTTP server that way gives `ERR_SSL_PROTOCOL_ERROR`.
-> Serving real HTTPS sidesteps the browser. If you're *sure* your browser won't
-> upgrade, you can run plain HTTP instead:
->
-> ```bash
-> python server.py --http      # then open http://localhost:8000
-> ```
->
-> Open `localhost`, not your LAN IP.
-
-The first run downloads the detection model (`yolo11s.pt`, ~19 MB) automatically.
-The first time you use **Read**, EasyOCR downloads its Nepali + English models —
-Navigate is unaffected.
-
-## Accuracy & robustness layer
-A wearable camera sees bad light, motion blur and tilt, so every mode runs frames
-through one shared QA layer, [`frame_quality.py`](frame_quality.py):
-- **`enhance()`** — CLAHE adaptive contrast (+ auto-gamma when dark), applied before
-  every inference/OCR. The single biggest real-world accuracy win. Toggle with
-  `ENHANCE_FRAMES`; the Pi auto-disables it under load.
-- **`assess()`** — brightness + blur (variance of Laplacian). Junk frames are
-  **skipped** instead of emitting false positives; if a bad view persists ~2 s the
-  app says *"camera view is dark/unclear"* once (rate-limited, bilingual).
-
-Per-mode upgrades, all degrade gracefully on the Pi (`coco-ncnn`, CPU):
-- **Navigate** — model tiers (`fast`=yolo11n@320 / `balanced`=yolo11s@640 /
-  `accurate`=yolo11m@640 +TTA; Pi never uses `accurate`). **Class-aware urgency**
-  (`URGENCY_SCALE`): a nearby *person/vehicle* triggers "very close", a same-size
-  *bottle/phone* does not. **Path weighting**: things in your walking line (center +
-  lower frame) are announced first. ByteTrack + the event-driven `AnnouncementManager`
-  (no spam) are unchanged; per-track memory is capped (`MAX_TRACKS`).
-- **Read** — CLAHE → 2× upscale → deskew before EasyOCR; per-box confidence filter
-  (`OCR_CONF`), natural top→bottom/left→right ordering, and a **sideways rescue**
-  (retries 90/180/270° if low-confidence). Refuses to read blurry/dark junk.
-- **Describe** — **works offline**: with no key or no internet it synthesizes a
-  spoken description from the current detections (`describe_from_detections`, e.g.
-  *"In front of you: two people ahead, a chair on your left."*); online it adds an
-  ~8 s timeout + one retry and a hazard/stairs/doorway/sign-reading prompt.
-
-Camera health (covered/frozen/yanked cam) and a Pi **perf guard** (drop imgsz 320→256
-and disable enhance below `FPS_FLOOR`, restore when it recovers) keep the loop alive;
-every mode's errors are isolated so one can't crash Navigate. All knobs are top-of-file
-constants in [`frame_quality.py`](frame_quality.py) / [`vision_core.py`](vision_core.py).
-
-## Hands-free voice control (the assistant)
-Press **7** / 🎤 (or `V`) to start listening. It's an always-on assistant with
-**Navigate as the ambient default**; commands switch modes and return to Navigate.
-- **Wake word**: say **"hey sight …"** so background speech is ignored. ("hey sight,
-  read this" / "hey sight, how much".) Bare "hey sight" → "Yes?".
-- **Barge-in**: start talking and the assistant stops speaking and listens.
-- **Priority speech**: only one thing speaks at a time — hazards > command answers >
-  ambient navigation.
-- **Bilingual**: English *and* Nepali keywords (पढ = read, कति = how much, अगाडि के छ =
-  what's ahead, बाटो काट = cross, यो को हो = who's here, नोट जोड = add note…).
-- **Commands**: navigate · what's in front (Describe) · read this · read the label ·
-  how much · add this note / total / clear / undo / "pay 500" · can I cross · find my
-  {object} · who's here · remember this person as {name} · repeat · louder/softer/
-  slower/faster · stop · **help**. A live caption shows what was heard.
-- **Keys** also work: `C` crossing · `H` help · `D` steps the **DEMO** sequence
-  (read → crossing → who's here → banknote) so a live demo can't stall.
-
-The shared parser is [`commands.py`](commands.py) — the browser POSTs transcripts to
-`/command` and the Pi calls it directly, so both use identical logic.
-
-### Crossing, labels, money tally, faces
-- **Crossing** ([`crossing.py`](crossing.py)) — classifies a traffic light's color by
-  HSV, with **hysteresis** (confirmed changes only) and **fail-safe** wording
-  ("green … *looks* clear, listen for vehicles"; unclear/conflicting → "be careful").
-  Runs inside Navigate and answers "can I cross".
-- **Label reading** ([`labels.py`](labels.py)) — "read the label" parses expiry/MFG
-  dates (incl. **Bikram Sambat**), dosage, and product name → "This expired 2 months
-  ago", etc. Normal Read is unchanged.
-- **Money tally** ([`money.py`](money.py)) — "add this note / total / undo / pay 500"
-  keeps a running sum and computes change with a note breakdown, in EN + NE. Requires
-  classifier confidence > 0.7 to add.
-- **Faces** (opt-in, local) ([`faces.py`](faces.py)) — greets enrolled people by name
-  in Navigate and answers "who's here". Enroll first (consent-first):
-  `python face_enroll.py --name Ram`. Needs a provider:
-  `pip install insightface onnxruntime` (best) or `pip install face_recognition`.
-  Disabled gracefully if neither is installed.
-
-## Self-test
-Verify the moving parts before a demo (PASS/FAIL per check):
+Verify everything first:
 ```bash
-python server.py --selftest   # model, frame-QA, banknote, espeak-ng, EasyOCR, Gemini key
-python pi_app.py --selftest    # camera opens + returns a frame, NCNN model, audio, SoC temp
-python pi_app.py --list-cameras  # probe camera indices 0-4 (OS-aware backend)
+python server.py --selftest         # PASS/FAIL: models, OCR, TTS, Faces, Gemini key
 ```
 
-## Model profiles (laptop = heavy, Pi = light)
-SoundSight auto-detects a **`FEATURE_PROFILE`** ([vision_core.py](vision_core.py)) — no
-code edits to switch:
-- **`laptop`** (a CUDA GPU is present): heavy, accurate models — Navigate uses
-  **yolo11m@640 FP16**, Read uses **EasyOCR on GPU**, Faces use **InsightFace
-  buffalo_l**, Describe falls back to a **local Ollama VLM** when offline. FP16
-  keeps VRAM small (yolo11m ≈ 75 MB). Dial models up/down via the `LAPTOP_*`
-  constants at the top of `vision_core.py` (each has a lighter alternative noted).
-- **`pi`** (ARM / no CUDA): the light path only — **yolo11n NCNN @320 on CPU**. Heavy
-  models never load here. Unchanged from before.
+---
 
-## Distributed compute (Pi ⇄ laptop, optional)
-The wearable Pi can **offload heavy on-demand AI to the laptop GPU** over a LAN
-(phone or laptop hotspot), while the **real-time safety loop (Navigate) always stays
-local on the Pi**. If the laptop is unreachable, each feature **falls back to the
-Pi's own model** automatically (one spoken "using on-device mode" notice) — it never
-hangs or crashes.
+## Quick start — Raspberry Pi 4
+
+Full guide: **[README_PI.md](README_PI.md)**. In short:
+
 ```bash
-# 1. on the LAPTOP: run the compute server on the LAN (binds 0.0.0.0, prints its IP)
+git clone <your-repo> soundsight && cd soundsight
+bash setup_pi.sh                    # venv + apt (espeak-ng, libgl1, portaudio) + pip
+source .venv/bin/activate
+# copy yolo11n_ncnn_model/ from the laptop (or it auto-exports on first run)
+python pi_app.py --list-cameras     # find your USB camera index
+python pi_app.py --selftest         # camera + model + audio + laptop-link check
+python pi_app.py                    # run. Navigate + distance + hazards are 100% local.
+```
+The Pi auto-runs the **light path** (yolo11n NCNN @320, CPU). Audio comes out the 3.5 mm jack
+(`sudo raspi-config` → Audio). Pi offline voice (Vosk) is **off by default** (`VOICE_ENABLED`
+in `pi_app.py`) — enable it after installing `vosk` + a model on the Pi.
+
+---
+
+## Pi + Laptop together (distributed compute)
+
+The Pi does the real-time loop locally and offloads heavy on-demand work to the laptop GPU.
+
+```bash
+# 1. Make a hotspot (phone or laptop). Connect BOTH devices to it.
+
+# 2. On the LAPTOP — start the compute server on the LAN (binds 0.0.0.0, prints its IP):
 python server.py --lan
+#    -> "Point the Pi at it: export COMPUTE_SERVER_URL=http://192.168.x.x:8000"
 
-# 2. on the PI: auto-find the laptop and run, or set the URL by hand
+# 3. On the PI — auto-discover the laptop and run (or set the URL by hand):
 python pi_app.py --find-server
-#   or:  export COMPUTE_SERVER_URL=http://<laptop-ip>:8000 && python pi_app.py
-
-# verify before the demo (reports laptop ONLINE + round-trip ms):
-python pi_app.py --selftest
+#    or:  export COMPUTE_SERVER_URL=http://<laptop-ip>:8000 && python pi_app.py
 ```
-Read / Money / Faces / Describe then run on the laptop GPU (fast, accurate), spoken on
-the Pi; Navigate stays smooth and local. The client is stdlib-only
-([remote.py](remote.py)) — no extra deps on the Pi. Internet is needed **only** for
-Gemini inside `/describe` (phone hotspot); the laptop uses a local Ollama VLM
-(`LAPTOP_VLM_MODEL`, e.g. `ollama pull llava`) when there's no internet.
 
-## Logging
-On startup the backend prints the **profile** and which model loaded per feature.
-During Navigate the 15-frame debug log adds **frame brightness + blur score**, whether
-**enhance** ran, the imgsz, **why** each object was announced
-(`new/escalation/change/refresh`), OCR **mean confidence** per Read, and whether
-Describe used **Gemini or the offline fallback**.
+- **Read / Money / Faces / Describe / Find** run on the laptop GPU (fast, accurate) and are
+  spoken on the Pi. **Navigate + hazards stay local** and smooth.
+- If the laptop disappears mid-run, those features **fall back to the Pi's own models**, speak
+  a one-time *"using on-device mode"*, and reconnect automatically. Nothing hangs or crashes.
+- Internet (phone) is needed **only** for Gemini Describe; the laptop uses a local Ollama VLM
+  when offline. Pi→laptop is pure LAN (no internet).
 
-## GPU notes (your RTX 5060 / Blackwell)
+`python pi_app.py --selftest` reports the laptop **ONLINE/OFFLINE** + a sample round-trip time.
 
-`ultralytics` installs `torch` for you, but the **default wheel is CPU-only**
-(`torch x.y.z+cpu`), so the startup log says `CPU`. Blackwell (RTX 50-series,
-`sm_120`) also needs a **CUDA 12.8** build. On **Python 3.14** there is *no
-stable* cu128 wheel yet (stable tops out at Python 3.13), so you must use the
-**nightly** cu128 build — it does ship a Windows `cp314` wheel:
+---
+
+## How the key parts work
+
+- **Navigate is event-driven.** Every object gets a stable ByteTrack id; the `AnnouncementManager`
+  speaks only on a *change* (new object, urgency escalation, zone/count change, or a refresh
+  after silence) — so it never loops "person nearby" at you. Urgency is **class-aware** (a
+  nearby person is "very close"; a same-size bottle is not) and **path-weighted** (things in
+  your walking line first). All in [vision_core.py](vision_core.py).
+- **Frame quality** ([frame_quality.py](frame_quality.py)) CLAHE-enhances every frame before
+  inference and gates genuinely unusable frames (dark/blown-out) — blur is tolerated (YOLO
+  handles soft focus), so it doesn't nag on normal frames.
+- **Money never hallucinates.** A classifier always outputs *some* class, so Money uses a
+  confidence + margin gate, a "background → no note" rule, and **majority voting over ~10
+  frames** — a wall or hand yields "no note", never a denomination. ([money.py](money.py),
+  `BanknoteClassifier` in vision_core.py)
+- **Nepali speech is tiered for quality**: pre-recorded clips in `audio/ne/` for the fixed
+  vocabulary → gTTS (online) for arbitrary text → espeak-ng (offline). ([nepali_phrases.py](nepali_phrases.py),
+  regenerate with `python gen_voice.py`)
+- **Offload is stdlib-only** ([remote.py](remote.py)) — short timeouts, any error → local
+  fallback, never a hang.
+- **Robustness:** a global error handler makes every endpoint return a spoken-friendly message
+  instead of a crash; the camera auto-reopens; heavy models fall back to light on load failure;
+  memory is capped on all tracker/announcer state.
+
+---
+
+## Offline vs online
+
+| Runs offline | Needs internet |
+|---|---|
+| Navigate, distance, hazards, Crossing | **Describe via Gemini** (use a phone hotspot) |
+| Read/OCR, Money (all), Faces | gTTS (only for *arbitrary* Nepali text; fixed phrases are pre-recorded) |
+| English speech + **Nepali speech** (espeak-ng / pre-recorded) | SOS dispatch (the local loud alert works offline) |
+| Voice commands (browser, or Pi Vosk), Pi↔laptop LAN offload | |
+
+---
+
+## Profiles & models (laptop = heavy, Pi = light)
+
+`FEATURE_PROFILE` auto-selects per device. Dial models via the `LAPTOP_*` constants at the top
+of [vision_core.py](vision_core.py) (each has a lighter alternative noted):
+
+| Feature | Laptop (`laptop`) | Pi (`pi`) |
+|---|---|---|
+| Detection | yolo11m @640 **FP16** | yolo11n **NCNN @320** (CPU) |
+| OCR | EasyOCR **GPU** | EasyOCR CPU |
+| Faces | InsightFace **buffalo_l** | offload-only |
+| Depth | Depth Anything V2-Small | geometric only |
+| Describe (offline) | Ollama VLM | offload / Gemini |
+
+FP16 keeps VRAM small (yolo11m ≈ 75 MB) so it fits the 8 GB budget alongside the other models.
+
+---
+
+## Self-test & demo
 
 ```bash
-# install the GPU build over the CPU one (~2.5 GB download)
+python server.py --selftest     # laptop: 8/8 checks (model, OCR, TTS, Faces, Gemini)
+python pi_app.py --selftest     # pi: camera frame, NCNN model, audio, laptop link + round-trip
+python pi_app.py --list-cameras # probe camera indices (OS-aware backend)
+```
+In the browser, key **D** steps the scripted demo (read → crossing → who's here → money).
+
+---
+
+## Project layout
+
+| File | Purpose |
+|---|---|
+| `vision_core.py` | All core AI: detection, tracking, urgency, announcer, banknote classifier, OfflineTTS, SceneDescriber, FEATURE_PROFILE |
+| `server.py` | FastAPI: the web app **and** the `--lan` compute server (`/remote/*`) |
+| `pi_app.py` | Raspberry Pi entrypoint (light local loop + offload + selftest) |
+| `index.html` | Browser UI: camera, Web Speech, voice control, priority speech queue, all modes |
+| `frame_quality.py` | Shared CLAHE enhance + quality gate + deskew |
+| `commands.py` | One shared bilingual voice-command parser (laptop + Pi) |
+| `remote.py` | Pi→laptop compute-offload client (stdlib only) |
+| `camera.py` | OS-aware camera open (Windows DSHOW / Pi V4L2) |
+| `crossing.py` · `money.py` · `labels.py` · `faces.py` · `distance.py` · `nepali_phrases.py` | Per-feature modules |
+| `train_banknote.py` · `train_banknote_detect.py` · `predict_banknote.py` | Banknote model training/inference |
+| `setup_pi.sh` · `requirements_pi.txt` · `README_PI.md` | Raspberry Pi packaging |
+| `FEATURES.md` | **Audited, honest status of every feature** |
+
+---
+
+## GPU notes (RTX 50-series / Blackwell)
+
+`ultralytics` installs a CPU-only `torch` by default. For a Blackwell GPU (sm_120) you need a
+CUDA 12.8 build; on Python 3.14 use the nightly wheel:
+```bash
 pip install --pre --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128
-```
-
-Verify the GPU is seen:
-
-```bash
 python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
-# -> True NVIDIA GeForce RTX 5060 Laptop GPU
 ```
-
-Then restart `python server.py`; the log should now read
-`loaded on device: CUDA`.
-
-### Python version
-You're on **Python 3.14**. The CPU stack installs fine there, and the **nightly**
-cu128 GPU build above has a `cp314` Windows wheel. If you'd rather use the
-*stable* GPU stack (cu128 up to Python 3.13), recreate the venv with 3.13:
-
-```bash
-py -3.13 -m venv .venv
-pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu128
-```
-
-## Porting to Raspberry Pi
-Keep [`vision_core.py`](vision_core.py) as-is. Replace [`server.py`](server.py)'s
-transport with your hardware loop: grab frames from the Pi camera, call
-`VisionCore.detect()` + `select_announcements()`, and drive a speaker/haptics
-instead of the browser. The `Announcer`, zones, and priority logic come along
-unchanged.
 
 ## What's intentionally NOT here
-No auth, no database, no Docker — minimal and working by design.
+No auth, no database, no Docker — a focused assistive prototype. Some heavy features depend on
+extra installs (InsightFace for Faces — already added; Vosk for Pi voice — off by default);
+unreliable paths are disabled behind flags rather than left flaky. See FEATURES.md.

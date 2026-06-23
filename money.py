@@ -10,8 +10,8 @@ adds a SESSION TALLY on top:
   * double-count guard so the same note isn't added twice in a row
 
 All amounts are spoken in BOTH English and Nepali. MoneyTally is pure logic (fully
-unit-testable); classify_notes() bridges to the banknote classifier (single note, or
-best-effort multi-note via tiling).
+unit-testable); count_notes()/detect_notes() do MULTI-note counting (Path A detection
+model if present, else Path B contour + classifier).
 """
 
 import logging
@@ -23,7 +23,6 @@ DENOMS = [1000, 500, 100, 50, 20, 10, 5]   # Nepali rupee notes, high -> low
 CLASS_VALUE = {"rs5": 5, "rs10": 10, "rs20": 20, "rs50": 50,
                "rs100": 100, "rs500": 500, "rs1000": 1000}
 ADD_COOLDOWN = 2.5     # s: same value within this window is treated as the same note (no double add)
-TILE_CONF = 0.80       # multi-note tiling needs HIGH confidence (tiling is noisy)
 
 
 def class_to_value(name):
@@ -33,10 +32,6 @@ def class_to_value(name):
 def to_devanagari(n):
     """Integer -> Devanagari digits, e.g. 650 -> '६५०' (for clear Nepali speech)."""
     return str(int(n)).translate(str.maketrans("0123456789", "०१२३४५६७८९"))
-
-
-def _en_word(value, count):
-    return f"{count} {value}{'s' if count > 1 else ''}"   # "two 500s" -> we pass count as word below
 
 
 _NUM_EN = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five",
@@ -250,29 +245,3 @@ def count_notes(frames, classifier=None, detect_model=None):
     log.info("Money count: total=%d count=%d notes=%s", res["total"], res["count"],
              [nn["value"] for nn in res["notes"]])
     return res
-
-
-def classify_notes(frame, classifier, multi=False, grid=3, min_conf=TILE_CONF):
-    """Bridge to the banknote classifier. Returns a list of {value, conf, class}.
-
-    Single (default): classify the whole frame -> 0 or 1 note. Multi (best-effort):
-    tile the frame into grid x grid cells and classify each, keeping only HIGH-conf
-    cells -- a crude stand-in until a banknote *detection* model is trained. Tiling
-    is noisy, hence the high threshold; document this limitation to users.
-    """
-    if classifier is None or classifier.model is None:
-        return []
-    if not multi:
-        r = classifier.classify(frame)
-        v = class_to_value(r.get("class"))
-        return [{"value": v, "conf": r.get("confidence", 0.0), "class": r.get("class")}] if (r.get("ok") and v) else []
-    h, w = frame.shape[:2]
-    found = []
-    for gy in range(grid):
-        for gx in range(grid):
-            tile = frame[gy * h // grid:(gy + 1) * h // grid, gx * w // grid:(gx + 1) * w // grid]
-            r = classifier.classify(tile)
-            v = class_to_value(r.get("class"))
-            if v and r.get("confidence", 0.0) >= min_conf:
-                found.append({"value": v, "conf": r.get("confidence", 0.0), "class": r.get("class")})
-    return found

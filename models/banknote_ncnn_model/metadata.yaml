@@ -1,0 +1,25 @@
+description: Ultralytics YOLO11n-cls model trained on dataset
+author: Ultralytics
+date: '2026-06-21T00:52:33.172867'
+version: 8.4.71
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 1
+task: classify
+batch: 1
+imgsz:
+- 224
+- 224
+names:
+  0: rs10
+  1: rs100
+  2: rs1000
+  3: rs20
+  4: rs5
+  5: rs50
+  6: rs500
+args:
+  batch: 1
+  half: false
+channels: 3
+end2end: false

@@ -10,15 +10,10 @@ key.pem
 __pycache__/
 *.pyc
 
-# Model weights / exports downloaded or generated at runtime
-*.pt
-*_ncnn_model/
-
 # Banknote classifier: your photos, training runs, and exported models
 dataset/
 runs/
 banknote_runs/
-models/
 
 # Voice / faces: local-only data and downloaded models (NEVER commit faces!)
 faces_db/

@@ -49,6 +49,10 @@ log = logging.getLogger("soundsight.pi")
 # --- tunables (all here so they're easy to find) ---------------------------- #
 FRAME_INTERVAL = 0.15     # ~6-7 fps target; tracking persists across frames
 CAM_FAIL_LIMIT = 45       # consecutive failed reads before we reopen the camera (then back off)
+# Pi OFFLINE voice (Vosk) is OFF by default -- it needs `vosk` + `sounddevice` + a
+# downloaded model on the Pi (see README_PI.md). Cleanly disabled (not flaky) until
+# then. Set True (after installing those) to enable hands-free voice on the Pi.
+VOICE_ENABLED = False
 PERF_WINDOW = 30          # measure FPS over this many frames for the perf guard
 IMG_SIZE_FULL = 320       # Pi "fast" tier imgsz...
 IMG_SIZE_LOW = 256        # ...dropped to this under load
@@ -319,8 +323,12 @@ def run(server_url=None):
     crossing_mon = CrossingMonitor()
     mtally = MoneyTally()
     shared = {"frame": None, "dets": [], "find": None, "last": ""}
-    start_voice(_build_dispatch(speaker, banknote, crossing_mon, mtally, shared, remote),
-                on_partial=speaker.stop)   # on_partial -> barge-in
+    if VOICE_ENABLED:
+        start_voice(_build_dispatch(speaker, banknote, crossing_mon, mtally, shared, remote),
+                    on_partial=speaker.stop)   # on_partial -> barge-in
+    else:
+        log.info("Pi voice control DISABLED (VOICE_ENABLED=False). "
+                 "Install vosk+sounddevice+a model and set VOICE_ENABLED=True to enable.")
 
     cap, cam_index, backend = cam.find_camera()   # OS-aware, validated open
     if cap is None:

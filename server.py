@@ -22,9 +22,9 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, PlainTextResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 
 import commands
 import frame_quality as fq
@@ -71,6 +71,19 @@ except ImportError:
     pass  # python-dotenv is optional
 
 app = FastAPI(title="SoundSight")
+
+
+@app.exception_handler(Exception)
+async def graceful_error(request: Request, exc: Exception):
+    """SAFETY NET: any unhandled error in a one-shot endpoint returns a spoken-
+    friendly message (HTTP 200) instead of a 500, so a single mode's hiccup never
+    crashes the UX. Navigate is a separate WebSocket, already wrapped per-frame."""
+    log.exception("Unhandled error on %s: %s", request.url.path, exc)
+    return JSONResponse(status_code=200, content={
+        "ok": False, "available": True,
+        "text": "Sorry, that didn't work. Please try again.",
+        "text_ne": "माफ गर्नुहोस्, त्यो भएन। फेरि प्रयास गर्नुहोस्।"})
+
 
 # Load YOLO once at startup (logs which device it uses).
 vision = VisionCore()
@@ -682,6 +695,8 @@ def run_selftest():
           "loaded" if banknote.model is not None else "not trained yet (run train_banknote.py)"))
     check("offline TTS (espeak-ng)", lambda: (len(tts_engine.synth("परीक्षण", "ne")) > 0, "Nepali WAV synthesized"))
     check("EasyOCR", lambda: (get_ocr_reader() is not None, "Nepali+English reader ready"))
+    check("Faces (InsightFace)", lambda: (True,
+          "buffalo_l ready" if face_matcher.available else "DISABLED - pip install insightface onnxruntime"))
     has_key = bool(_os.environ.get("GEMINI_API_KEY") or _os.environ.get("GOOGLE_API_KEY"))
     check("Gemini key (Describe)", lambda: (True,
           "present - online Describe enabled" if has_key else "MISSING - Describe uses offline fallback"))

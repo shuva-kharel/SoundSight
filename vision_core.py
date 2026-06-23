@@ -31,7 +31,6 @@ import subprocess
 from collections import deque
 
 import cv2
-import numpy as np
 import torch
 from ultralytics import YOLO
 
@@ -255,9 +254,6 @@ HAZARD_CLASSES = {
     "stairs", "pole", "obstacle", "curb", "pothole",
 }
 
-ANNOUNCE_COOLDOWN = 2.5    # legacy Announcer only
-VERY_CLOSE_COOLDOWN = 1.0  # legacy Announcer only
-
 # PATH weighting: objects in the walking path (center third AND lower half of the
 # frame) matter more than ones up high or off to the edges. Adds 0..PATH_WEIGHT*2
 # to an object's ranking so the thing you're about to walk into is announced first.
@@ -313,24 +309,6 @@ class QualityGate:
         return a, speak
 
 
-class Announcer:
-    """LEGACY time-based cooldown -- superseded by AnnouncementManager (kept for
-    reference). Prevents repeating the same object+zone within `cooldown` seconds.
-    """
-
-    def __init__(self, cooldown=ANNOUNCE_COOLDOWN):
-        self.cooldown = cooldown
-        self.last = {}
-
-    def consider(self, label, zone, now, cooldown=None):
-        cd = self.cooldown if cooldown is None else cooldown
-        key = (label, zone)
-        if now - self.last.get(key, -999) >= cd:
-            self.last[key] = now
-            return f"{label} {zone}"
-        return None
-
-
 # ----- natural-language helpers -------------------------------------------- #
 _NUMBER_WORDS = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five",
                  6: "six", 7: "seven", 8: "eight", 9: "nine"}
@@ -354,21 +332,27 @@ def _pluralize(name, n):
     return name + "s"
 
 
-def _phrase(name, zone, urgency, count, approaching=False):
-    """Natural wording for one (possibly multi-member) group.
+def _phrase(name, zone, urgency, count, approaching=False, distance=None):
+    """Natural wording for one (possibly multi-member) group, with an HONEST metric
+    distance when known ("person ahead, about 2 meters").
     Returns (text, rate, urgent) -- same fields select_announcements always had."""
+    dsuf = ""
+    if distance is not None:   # distance.py is wired in by the caller when available
+        import distance as _dist
+        sp = _dist.spoken_distance(distance)
+        dsuf = (", " + sp) if (sp and sp != "right in front") else ""
     # A very-close warning is about the single nearest hazard, not the count.
     # (Comma rather than an em-dash: safe for espeak-ng + Windows console logs.)
     if urgency == URGENCY_VERY_CLOSE:
         if zone == "ahead":
             return f"Careful, {name} right in front", 1.3, True
-        return f"Careful, {name} {zone}", 1.3, True
+        return f"Careful, {name} {zone}{dsuf}", 1.3, True
     head = name if count == 1 else f"{_number_word(count)} {_pluralize(name, count)}"
     if approaching:
-        return f"{head} {zone}, getting closer", 1.0, False
-    if urgency == URGENCY_NEAR:
+        return f"{head} {zone}{dsuf}, getting closer", 1.0, False
+    if not dsuf and urgency == URGENCY_NEAR:
         return f"{head} {zone}, close", 1.0, False
-    return f"{head} {zone}", 1.0, False
+    return f"{head} {zone}{dsuf}", 1.0, False
 
 
 # --------------------------------------------------------------------------- #
