@@ -1,22 +1,52 @@
-# Secrets -- NEVER commit your real API keys
-.env
+# ===========================================================================
+#  SoundSight  --  .gitignore
+#  Goal: commit CODE + small assets you can't regenerate (trained banknote
+#  model, pre-recorded Nepali phrases). Ignore secrets, virtualenvs, caches,
+#  training data, and BIG models that download/export automatically.
+# ===========================================================================
 
-# Local HTTPS cert (regenerated automatically)
+# --- Secrets & local config -- NEVER commit -------------------------------
+.env
+.env.*
+!.env.example
+
+# --- Local HTTPS cert (regenerated automatically on first run) -------------
 cert.pem
 key.pem
 
-# Python
+# --- Python ----------------------------------------------------------------
 .venv/
+venv/
+env/
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
 
-# Banknote classifier: your photos, training runs, and exported models
+# --- Big / auto-downloaded models (NOT needed in the repo) -----------------
+# CLIP weights for YOLO-World open-vocab -- 337 MB, auto-downloads on first use.
+weights/
+# Stock Ultralytics YOLO weights + their NCNN exports -- auto-download/export.
+yolo*.pt
+yolo*_ncnn_model/
+# (KEPT in the repo on purpose: models/banknote.pt + models/banknote_ncnn_model/
+#  -- your TRAINED model, small and not re-downloadable.)
+
+# --- Training data & outputs (large, regenerable) --------------------------
 dataset/
 runs/
 banknote_runs/
-weights/
 
-# Voice / faces: local-only data and downloaded models (NEVER commit faces!)
+# --- Local-only user data (NEVER commit faces!) ----------------------------
 faces_db/
 models_vosk/
 vosk-model*/
+
+# --- Editor / tooling / OS junk --------------------------------------------
+.claude/
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
