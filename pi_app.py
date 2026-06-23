@@ -663,10 +663,13 @@ def selftest(camera_index=None):
             stderr=subprocess.PIPE,
             timeout=120,
         )
-        detail = (proc.stdout or proc.stderr or "").strip().splitlines()
+        err = proc.stderr or ""
+        detail = (proc.stdout or err or "").strip().splitlines()
         detail = detail[-1] if detail else f"exit={proc.returncode}"
         if proc.returncode == -11:
             detail = "torch segfaulted on import; use remote-only mode or rebuild venv with a supported torch/python"
+        elif "null bytes" in err:
+            detail = "corrupted venv file (NUL bytes) -- run: python pi_app.py --repair-venv"
         return proc.returncode == 0, detail
 
     check("model load + infer", model_check)
@@ -731,6 +734,9 @@ def diag_imports():
 
 
 def torch_import_ok():
+    """(ok, stderr): does `import torch` succeed in a clean child process?
+    Returns the child's stderr too so the caller can detect the specific failure
+    (e.g. NUL-byte corruption) and give targeted repair advice."""
     proc = subprocess.run(
         [sys.executable, "-X", "faulthandler", "-c", "import torch; print(torch.__version__)"],
         text=True,
@@ -738,7 +744,124 @@ def torch_import_ok():
         stderr=subprocess.PIPE,
         timeout=60,
     )
-    return proc.returncode == 0
+    return proc.returncode == 0, (proc.stderr or "")
+
+
+# --------------------------------------------------------------------------- #
+# venv repair -- fix files corrupted by an interrupted pip install / bad SD card
+# --------------------------------------------------------------------------- #
+# Symptom: `SyntaxError: source code string cannot contain null bytes` on import.
+# A half-written .py file (NUL bytes) anywhere in site-packages takes down torch /
+# ultralytics / vision_core. We scan for those files and force-reinstall ONLY the
+# affected distributions -- much faster and safer than rebuilding the whole venv.
+
+def _site_packages_dirs():
+    import sysconfig
+    dirs = []
+    try:
+        dirs.append(sysconfig.get_paths()["purelib"])
+    except Exception:
+        pass
+    for p in sys.path:
+        if p.endswith("site-packages") and os.path.isdir(p) and p not in dirs:
+            dirs.append(p)
+    return [d for d in dirs if os.path.isdir(d)]
+
+
+def _import_to_distribution():
+    """Map a top-level import name (e.g. 'cv2') to its pip distribution name
+    (e.g. 'opencv-python-headless') so we reinstall the right thing."""
+    try:
+        from importlib import metadata
+        mapping = {}
+        for top, dists in metadata.packages_distributions().items():
+            if dists:
+                mapping[top] = dists[0]
+        return mapping
+    except Exception:
+        return {}
+
+
+def scan_corrupt_files():
+    """Walk site-packages for .py files containing NUL bytes (the corruption
+    signature). Returns {distribution_name: [sample_paths...]}."""
+    import_to_dist = _import_to_distribution()
+    corrupt = {}
+    for sp in _site_packages_dirs():
+        for root, _dirs, files in os.walk(sp):
+            for fn in files:
+                if not fn.endswith(".py"):
+                    continue
+                path = os.path.join(root, fn)
+                try:
+                    with open(path, "rb") as fh:
+                        data = fh.read()
+                except OSError:
+                    continue
+                if b"\x00" not in data:
+                    continue
+                rel = os.path.relpath(path, sp)
+                top = rel.split(os.sep)[0]
+                top = top[:-3] if top.endswith(".py") else top
+                dist = import_to_dist.get(top, top)
+                corrupt.setdefault(dist, []).append(path)
+    return corrupt
+
+
+def repair_venv(apply=False):
+    """Find NUL-corrupted files in the venv and (if apply) force-reinstall the
+    affected packages. Run with --repair-venv to actually fix; --scan-corrupt to
+    only report. Exits 0 if the venv is clean (or was repaired)."""
+    print("\n================ SoundSight venv corruption scan ================")
+    print("Scanning site-packages for files with NUL bytes (interrupted install / bad SD card)...")
+    corrupt = scan_corrupt_files()
+    if not corrupt:
+        print("  [OK] No corrupted .py files found.")
+        ok, err = torch_import_ok()
+        if ok:
+            print("  [OK] `import torch` succeeds.")
+        else:
+            print("  [!] No NUL-byte files, but torch still fails to import:")
+            print("      " + err.strip().replace("\n", "\n      "))
+            print("      This may be a torch/Python version mismatch rather than corruption.")
+            print("      Try: pip install --force-reinstall --no-cache-dir -r requirements_pi.txt")
+        print("=================================================================")
+        raise SystemExit(0 if ok else 1)
+
+    dists = sorted(corrupt)
+    print(f"  [!] Corrupted packages found: {', '.join(dists)}")
+    for dist, paths in corrupt.items():
+        print(f"      - {dist}: {len(paths)} file(s), e.g. {paths[0]}")
+
+    if not apply:
+        print("\n  Re-run with --repair-venv to reinstall these packages, or manually:")
+        print(f"    pip install --force-reinstall --no-cache-dir {' '.join(dists)}")
+        print("=================================================================")
+        raise SystemExit(1)
+
+    # Reinstall via the SAME interpreter's pip so we hit this venv, not system pip.
+    cmd = [sys.executable, "-m", "pip", "install",
+           "--force-reinstall", "--no-cache-dir"] + dists
+    print("\n  Repairing:", " ".join(cmd))
+    rc = subprocess.run(cmd).returncode
+    if rc != 0:
+        print("  [FAIL] pip reinstall failed (exit %d). Check network / disk space." % rc)
+        print("=================================================================")
+        raise SystemExit(rc)
+
+    # Verify the corruption is actually gone.
+    still_bad = scan_corrupt_files()
+    ok, err = torch_import_ok()
+    if still_bad:
+        print("  [!] Still corrupted after reinstall:", ", ".join(sorted(still_bad)))
+        print("      The SD card may be failing. Re-run, or rebuild the venv (bash setup_pi.sh).")
+        print("=================================================================")
+        raise SystemExit(1)
+    print("  [OK] No corrupted files remain.")
+    print("  [%s] `import torch` %s." % ("OK" if ok else "!!", "succeeds" if ok else "still fails:\n      " + err.strip()))
+    print("  Now run:  python pi_app.py --selftest")
+    print("=================================================================")
+    raise SystemExit(0 if ok else 1)
 
 
 def main():
@@ -747,6 +870,10 @@ def main():
                     help="check camera/model/audio/offload and exit with a PASS/FAIL report")
     ap.add_argument("--diag-imports", action="store_true",
                     help="isolate native import crashes for cv2/torch/ultralytics")
+    ap.add_argument("--scan-corrupt", action="store_true",
+                    help="scan the venv for NUL-corrupted files (cause of 'null bytes' errors) and report")
+    ap.add_argument("--repair-venv", action="store_true",
+                    help="scan AND force-reinstall any NUL-corrupted packages, then verify torch imports")
     ap.add_argument("--remote-only", action="store_true",
                     help="Torch-free mode: use the laptop compute server for detection")
     ap.add_argument("--list-cameras", action="store_true",
@@ -758,6 +885,10 @@ def main():
     args = ap.parse_args()
     if args.diag_imports:
         diag_imports()
+    elif args.repair_venv:
+        repair_venv(apply=True)
+    elif args.scan_corrupt:
+        repair_venv(apply=False)
     elif args.list_cameras:
         cam = _import_camera()
         cam.list_cameras()
@@ -774,10 +905,21 @@ def main():
                 log.warning("No compute server found -- running on-device.")
         if args.remote_only or server_url or os.environ.get("COMPUTE_SERVER_URL"):
             raise SystemExit(run_remote_only(server_url, args.camera_index))
-        if not torch_import_ok():
-            log.error("Torch crashes on this Pi Python environment, so local AI mode cannot start.")
-            log.error("Start the laptop with `python server.py --lan`, then run the Pi with `python pi_app.py --find-server`.")
-            log.error("For on-device mode, rebuild the Pi venv with a Python/Torch combination that imports cleanly.")
+        ok, err = torch_import_ok()
+        if not ok:
+            log.error("Torch can't be imported on this Pi, so local AI mode cannot start.")
+            if "null bytes" in err or "source code string cannot contain" in err:
+                # Corrupted file on disk -- the fast, exact fix is reinstalling it.
+                log.error("Cause: a Python file in the venv is corrupted (NUL bytes) -- usually an")
+                log.error("interrupted pip install or a failing SD card, NOT a version problem.")
+                log.error("FIX IT IN PLACE:  python pi_app.py --repair-venv")
+                log.error("(or scan first:    python pi_app.py --scan-corrupt)")
+            else:
+                log.error("For on-device mode, rebuild the Pi venv with a Python/Torch combination "
+                          "that imports cleanly (bash setup_pi.sh).")
+            log.error("MEANWHILE, run with the laptop doing detection:")
+            log.error("  laptop:  python server.py --lan")
+            log.error("  Pi:      python pi_app.py --find-server")
             raise SystemExit(1)
         run(server_url, args.camera_index)
 

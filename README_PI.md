@@ -54,7 +54,23 @@ python pi_app.py --diag-imports  # if startup segfaults: isolate cv2/torch/ultra
 python pi_app.py --list-cameras  # which index your webcam is on (0/1/2…)
 python pi_app.py --camera-index 1 # run with the working camera index. Ctrl+C to stop.
 ```
-If `--diag-imports` shows `torch` segfaulting, run laptop-offload mode instead:
+### `SyntaxError: source code string cannot contain null bytes`
+If `--selftest` / `--diag-imports` shows torch (or `ultralytics` / `vision_core`)
+failing with **"source code string cannot contain null bytes"**, a Python file in
+the venv is **corrupted** — half-written by an interrupted `pip install`, a power
+cut, or a failing SD card. It is *not* a torch/Python version problem. Fix it in
+place by reinstalling only the corrupted packages:
+```bash
+python pi_app.py --scan-corrupt   # report which packages are corrupted (read-only)
+python pi_app.py --repair-venv    # force-reinstall them, then verify torch imports
+python pi_app.py --selftest       # confirm model load + infer now PASS
+```
+If `--repair-venv` says files are *still* corrupted after reinstalling, the SD card
+is likely failing — reflash to a fresh card and re-run `bash setup_pi.sh`.
+
+### torch segfaults / can't be fixed: run laptop-offload mode
+If `--diag-imports` shows `torch` **segfaulting** (not the null-bytes error above),
+run laptop-offload mode instead:
 ```bash
 # laptop
 python server.py --lan
