@@ -775,8 +775,10 @@ def _import_to_distribution():
         from importlib import metadata
         mapping = {}
         for top, dists in metadata.packages_distributions().items():
-            if dists:
-                mapping[top] = dists[0]
+            # Corrupted .dist-info can yield empty/None entries -- keep only real names.
+            names = [d for d in (dists or []) if d]
+            if names:
+                mapping[top] = names[0]
         return mapping
     except Exception:
         return {}
@@ -803,7 +805,9 @@ def scan_corrupt_files():
                 rel = os.path.relpath(path, sp)
                 top = rel.split(os.sep)[0]
                 top = top[:-3] if top.endswith(".py") else top
-                dist = import_to_dist.get(top, top)
+                # Fall back to the import name if the distribution can't be resolved
+                # (`or top` guards against a None value from broken metadata).
+                dist = import_to_dist.get(top) or top
                 corrupt.setdefault(dist, []).append(path)
     return corrupt
 
