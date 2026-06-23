@@ -356,7 +356,7 @@ def _build_dispatch(speaker, banknote, crossing_mon, mtally, shared, fq, remote)
     return on_command
 
 
-def run(server_url=None, camera_index=None):
+def run(server_url=None, camera_index=None, show=False, web=False, web_port=8080, no_enhance=False):
     # Import the Pi-only dependencies lazily so startup errors are reported cleanly.
     cam = _import_camera()
     fq = _import_frame_quality()
@@ -368,6 +368,9 @@ def run(server_url=None, camera_index=None):
     from vision_core import AnnouncementManager, ApproachDetector, QualityGate, VisionCore, select_announcements
 
     vision = VisionCore(mode="coco-ncnn", accuracy="fast")
+    if no_enhance:
+        vision.enhance_frames = False   # skip the OpenCV CLAHE path (cv2 segfault dodge)
+        log.info("Frame enhance DISABLED (--no-enhance): skipping OpenCV CLAHE.")
     manager = AnnouncementManager()
     approach = ApproachDetector()
     gate = QualityGate()
@@ -400,6 +403,11 @@ def run(server_url=None, camera_index=None):
         log.error("No camera found. Try `python pi_app.py --list-cameras` to locate it.")
         return
     log.info("SoundSight Pi running on camera %d (%s). Ctrl+C to stop.", cam_index, backend)
+
+    preview = None
+    if web:
+        from pi_web import WebPreview
+        preview = WebPreview(port=web_port, title="SoundSight Pi (on-device)").start()
 
     fails = 0                 # consecutive failed reads
     low_power = False         # perf guard active?
@@ -448,9 +456,16 @@ def run(server_url=None, camera_index=None):
                 # --- detect + announce (same pipeline as the server) ---------- #
                 detections = vision.detect(frame, assessment=assess)  # enhances internally
                 shared["frame"], shared["dets"] = frame, detections    # for voice commands
+                if show:   # terminal visibility: what the Pi is seeing right now
+                    log.info("SEE: %s", ", ".join(
+                        f"{d['label']}({_closeness(d)})" for d in detections) or "(nothing)")
                 approaching = approach.approaching_objects(detections)
+                announced = None
                 for item in select_announcements(detections, manager, approaching, now):
                     speak(item["text"])
+                    announced = item["text"]
+                if preview is not None:   # live demo view of the Pi's own camera
+                    preview.update(frame, detections, announced)
 
                 # --- active object FIND guidance (set by a voice command) ----- #
                 if shared["find"]:
@@ -486,8 +501,9 @@ def run(server_url=None, camera_index=None):
                 elif low_power and fps > FPS_FLOOR + 1.5 and not hot:
                     low_power = False
                     vision.set_imgsz(IMG_SIZE_FULL)
-                    vision.enhance_frames = True
-                    log.info("Perf guard OFF: fps=%.1f -> imgsz=%d, enhance on", fps, IMG_SIZE_FULL)
+                    vision.enhance_frames = not no_enhance   # keep it off if --no-enhance
+                    log.info("Perf guard OFF: fps=%.1f -> imgsz=%d, enhance %s",
+                             fps, IMG_SIZE_FULL, "off" if no_enhance else "on")
                 else:
                     log.info("Pi FPS: %.1f%s", fps, f" temp={temp:.0f}C" if temp else "")
                 win_t0, win_frames = time.time(), 0
@@ -561,7 +577,7 @@ class RemoteAnnouncementManager:
         return None
 
 
-def run_remote_only(server_url=None, camera_index=None):
+def run_remote_only(server_url=None, camera_index=None, show=False, web=False, web_port=8080):
     """Torch-free Pi mode: camera on the Pi, detection on the laptop server."""
     cam = _import_camera()
     fq = _import_frame_quality()
@@ -583,6 +599,11 @@ def run_remote_only(server_url=None, camera_index=None):
         return 2
     log.info("SoundSight Pi remote-only running on camera %d (%s). Ctrl+C to stop.", cam_index, backend)
 
+    preview = None
+    if web:
+        from pi_web import WebPreview
+        preview = WebPreview(port=web_port, title="SoundSight Pi (server detection)").start()
+
     manager = RemoteAnnouncementManager()
     offline_spoken = False
     try:
@@ -603,6 +624,8 @@ def run_remote_only(server_url=None, camera_index=None):
                 if not offline_spoken:
                     speaker.speak("Laptop is offline")
                     offline_spoken = True
+                if preview is not None:
+                    preview.update(frame, [], "Laptop is offline")
                 time.sleep(1.0)
                 continue
             offline_spoken = False
@@ -611,6 +634,11 @@ def run_remote_only(server_url=None, camera_index=None):
             msg = manager.choose(detections, frame.shape[1], time.time())
             if msg:
                 speaker.speak(msg)
+            if show:
+                log.info("SEE: %s", ", ".join(
+                    f"{d.get('label')}({_closeness(d)})" for d in detections) or "(nothing)")
+            if preview is not None:
+                preview.update(frame, detections, msg)
 
             dt = time.time() - t0
             if dt < FRAME_INTERVAL:
@@ -666,12 +694,11 @@ def selftest(camera_index=None):
         err = proc.stderr or ""
         detail = (proc.stdout or err or "").strip().splitlines()
         detail = detail[-1] if detail else f"exit={proc.returncode}"
-        if proc.returncode == -11:
-            detail = "torch segfaulted on import; use remote-only mode or rebuild venv with a supported torch/python"
-        elif "null bytes" in err:
+        if "null bytes" in err:
             detail = "corrupted venv file (NUL bytes) -- run: python pi_app.py --repair-venv"
-        elif proc.returncode == -6 or "double-linked list" in err or "Aborted" in err:
-            detail = "native abort in torch/torchvision -- run: python pi_app.py --reinstall-ml"
+        elif proc.returncode in (-6, -11) or "double-linked list" in err or "Aborted" in err:
+            detail = ("native crash (segfault/abort in torch/lap/opencv -- usually numpy-2 ABI) "
+                      "-- run: python pi_app.py --reinstall-ml")
         return proc.returncode == 0, detail
 
     check("model load + infer", model_check)
@@ -964,56 +991,157 @@ def nms_ok():
     return False, (tail[-1] if tail else f"exit={proc.returncode}")
 
 
+def lap_ok():
+    """Run the native `lap` linear-assignment op the ByteTrack tracker uses (the other
+    op that aborts with 'corrupted double-linked list'). (ok, detail)."""
+    proc = _run_py(
+        "import numpy as np\n"
+        "import lap\n"
+        "c = np.array([[1., 2.], [3., 4.]], dtype='float64')\n"
+        "cost, x, y = lap.lapjv(c, extend_cost=True)\n"
+        "print('lap ok', cost)\n",
+        timeout=60)
+    if proc.returncode == 0:
+        return True, (proc.stdout or "").strip().splitlines()[-1]
+    if proc.returncode == -6:
+        return False, "SIGABRT -- native `lap`/numpy ABI mismatch (rebuild lap against this numpy)"
+    tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+    return False, (tail[-1] if tail else f"exit={proc.returncode}")
+
+
+def cv2_ok():
+    """Run the exact OpenCV ops frame_quality.enhance() uses (cvtColor/split/CLAHE/
+    merge) in a child process. These segfault under a numpy-ABI mismatch. (ok, detail)."""
+    proc = _run_py(
+        "import numpy as np, cv2\n"
+        "f = (np.random.rand(64, 64, 3) * 255).astype('uint8')\n"
+        "lab = cv2.cvtColor(f, cv2.COLOR_BGR2LAB)\n"
+        "l, a, b = cv2.split(lab)\n"
+        "l = cv2.createCLAHE(2.0, (8, 8)).apply(l)\n"
+        "cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)\n"
+        "print('cv2 ok', cv2.__version__)\n",
+        timeout=60)
+    if proc.returncode == 0:
+        return True, (proc.stdout or "").strip().splitlines()[-1]
+    if proc.returncode == -11:
+        return False, "SIGSEGV in OpenCV -- numpy-ABI mismatch (cv2 built for a different numpy)"
+    tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+    return False, (tail[-1] if tail else f"exit={proc.returncode}")
+
+
+def _numpy_major():
+    proc = _run_py("import numpy; print(numpy.__version__)", timeout=30)
+    try:
+        return int((proc.stdout or "").strip().split(".")[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def _opencv_dist():
+    """Which OpenCV distribution is installed (so we reinstall the right one)."""
+    from importlib import metadata
+    for name in ("opencv-python-headless", "opencv-python",
+                 "opencv-contrib-python-headless", "opencv-contrib-python"):
+        try:
+            metadata.version(name)
+            return name
+        except metadata.PackageNotFoundError:
+            continue
+    return "opencv-python-headless"
+
+
+def _native_health():
+    """(all_ok, lines): run every native op the Pi uses that can abort/segfault."""
+    nms, nms_d = nms_ok()
+    lap, lap_d = lap_ok()
+    cv, cv_d = cv2_ok()
+    lines = [
+        f"  [{'PASS' if nms else 'FAIL'}] torchvision NMS: {nms_d}",
+        f"  [{'PASS' if lap else 'FAIL'}] lap (tracker):   {lap_d}",
+        f"  [{'PASS' if cv  else 'FAIL'}] opencv (enhance): {cv_d}",
+    ]
+    return (nms and lap and cv), lines
+
+
 def reinstall_ml(apply=False):
-    """Diagnose and (if apply) cleanly reinstall a matched CPU torch + torchvision so
-    native inference stops aborting. --reinstall-ml to fix; the check runs first."""
+    """Diagnose and (if apply) fix the native stack so inference stops crashing.
+
+    Checks the three native ops that crash on this Pi -- torchvision NMS, `lap`
+    (tracker) and OpenCV (enhance) -- which all link numpy. The usual root cause is
+    a numpy-2 ABI mismatch (these wheels were built for numpy 1.x), so the fix pins
+    numpy<2 first, then, if needed, reinstalls a matched CPU torch/torchvision/lap +
+    OpenCV against that numpy."""
     print("\n============== SoundSight native ML-stack check ==============")
     info, cuda_build = ml_stack_info()
     print(info.replace("\n", "\n  ") if info else "  (could not read torch versions)")
     if cuda_build is not None:
-        print(f"  [!] torch is a CUDA/GPU build (cuda={cuda_build}). The Pi has NO GPU --")
-        print("      it MUST run the CPU build. This is the usual cause of the abort.")
-    ok, detail = nms_ok()
-    print(f"  [{'PASS' if ok else 'FAIL'}] torchvision NMS: {detail}")
+        print(f"  [!] torch is a CUDA/GPU build (cuda={cuda_build}). The Pi has NO GPU.")
+    healthy, lines = _native_health()
+    print("\n".join(lines))
+    npmaj = _numpy_major()
+    numpy2 = npmaj is not None and npmaj >= 2
+    if numpy2:
+        print(f"  [i] numpy is {npmaj}.x -- compiled wheels (cv2/lap/torchvision/scipy) built for")
+        print("      numpy 1.x crash under numpy 2.x. Pinning numpy<2 is the likely fix.")
 
-    if ok and cuda_build is None:
-        print("  Native stack looks healthy. If inference still aborts, run --selftest.")
+    if healthy and cuda_build is None:
+        print("\n  Native stack is healthy. If inference still crashes, run --selftest.")
         print("=============================================================")
         raise SystemExit(0)
 
-    # Force the CPU wheels from PyTorch's CPU index (matched torch+torchvision pair).
-    cmd = [sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-cache-dir",
-           "--extra-index-url", "https://download.pytorch.org/whl/cpu", "torch", "torchvision"]
+    opencv = _opencv_dist()
+    step1 = [sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-cache-dir", "numpy<2"]
+    step2 = [sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-cache-dir",
+             "--extra-index-url", "https://download.pytorch.org/whl/cpu",
+             "numpy<2", "torch", "torchvision", "lap", opencv]
     if not apply:
-        print("\n  Re-run with --reinstall-ml to fix, or do it manually:")
-        print("   ", " ".join(cmd))
+        print("\n  Re-run with --reinstall-ml to fix automatically, or do it manually:")
+        if numpy2:
+            print("    1) " + " ".join(step1) + "    # most likely fix on its own")
+        print("    2) " + " ".join(step2))
         print("=============================================================")
         raise SystemExit(1)
 
-    print("\n  Reinstalling CPU torch + torchvision:\n   ", " ".join(cmd))
-    rc = subprocess.run(cmd).returncode
+    # Step 1: if numpy is 2.x, downgrade it first -- often realigns the EXISTING
+    # numpy-1 wheels (cv2/lap/torchvision) with no other reinstall needed.
+    if numpy2:
+        print("\n  [1/2] Pinning numpy<2:\n   ", " ".join(step1))
+        if subprocess.run(step1).returncode == 0:
+            healthy, lines = _native_health()
+            print("\n  After numpy<2:")
+            print("\n".join(lines))
+            if healthy:
+                print("  [OK] Fixed by the numpy downgrade alone. Run:  python pi_app.py --selftest")
+                print("=============================================================")
+                raise SystemExit(0)
+            print("  Still not healthy -- reinstalling the native wheels against numpy<2...")
+
+    # Step 2: reinstall the matched CPU natives + OpenCV, constrained to numpy<2.
+    print("\n  [2/2] Reinstalling natives against numpy<2:\n   ", " ".join(step2))
+    rc = subprocess.run(step2).returncode
     if rc != 0:
         print("  [FAIL] pip reinstall failed (exit %d). Check network / disk space." % rc)
         print("=============================================================")
         raise SystemExit(rc)
 
     info, cuda_build = ml_stack_info()
-    ok, detail = nms_ok()
+    healthy, lines = _native_health()
     print("\n  After reinstall:")
     print(info.replace("\n", "\n  ") if info else "  (could not read torch versions)")
-    print(f"  [{'PASS' if ok else 'FAIL'}] torchvision NMS: {detail}")
-    if ok and cuda_build is None:
+    print("\n".join(lines))
+    if healthy and cuda_build is None:
         print("  [OK] Native stack fixed. Now run:  python pi_app.py --selftest")
         print("=============================================================")
         raise SystemExit(0)
-    # Still broken -- the CPU index didn't take (PyPI served a GPU wheel) or the SD
-    # card damaged a .so. Point at the most reliable ARM-CPU source (piwheels).
-    print("  [!] Still not healthy. Try the Raspberry-Pi CPU wheels from piwheels:")
+
+    print("\n  [!] Still not healthy. Last resorts:")
+    print("  - ARM-CPU wheels from piwheels:")
     print("      pip install --force-reinstall --no-cache-dir \\")
     print("        --index-url https://www.piwheels.org/simple \\")
-    print("        --extra-index-url https://pypi.org/simple torch torchvision")
-    print("  If it still aborts after that, the SD card is failing -- reflash and re-setup.")
-    print("  MEANWHILE you can run detection on the laptop:  python pi_app.py --find-server")
+    print(f"        --extra-index-url https://pypi.org/simple 'numpy<2' torch torchvision lap {opencv}")
+    print("  - Run a minimal, crash-free path now:  python pi_app.py --no-track --no-enhance")
+    print("  - If crashes persist across libraries, the SD card is failing -- reflash + setup_pi.sh.")
+    print("  - Or do all detection on the laptop:  python pi_app.py --find-server")
     print("=============================================================")
     raise SystemExit(1)
 
@@ -1029,9 +1157,11 @@ def main():
     ap.add_argument("--repair-venv", action="store_true",
                     help="scan AND force-reinstall any NUL-corrupted packages, then verify torch imports")
     ap.add_argument("--check-ml", action="store_true",
-                    help="check the native torch/torchvision build (catches 'corrupted double-linked list' aborts)")
+                    help="check the native stack (torchvision NMS, lap, opencv) for the segfault/"
+                         "'corrupted double-linked list' crashes; reports numpy version")
     ap.add_argument("--reinstall-ml", action="store_true",
-                    help="reinstall a matched CPU torch+torchvision to fix native inference aborts, then verify")
+                    help="fix native crashes: pin numpy<2 and reinstall matched CPU torch/torchvision/"
+                         "lap/opencv, then re-verify all three native ops")
     ap.add_argument("--remote-only", action="store_true",
                     help="Torch-free mode: use the laptop compute server for detection")
     ap.add_argument("--list-cameras", action="store_true",
@@ -1040,7 +1170,22 @@ def main():
                     help="open this camera index directly, e.g. 1 from --list-cameras")
     ap.add_argument("--find-server", action="store_true",
                     help="scan the LAN for the laptop compute server, then run using it")
+    ap.add_argument("--no-track", action="store_true",
+                    help="run detection without the ByteTrack tracker (avoids the native `lap` "
+                         "abort); detection still works, you just lose stable track ids")
+    ap.add_argument("--no-enhance", action="store_true",
+                    help="skip the OpenCV CLAHE frame-enhance step (avoids a cv2 segfault on a "
+                         "flaky native stack); slightly less accuracy in dim light")
+    ap.add_argument("--show", action="store_true",
+                    help="print detections to the terminal each frame so you can SEE what it detects")
+    ap.add_argument("--web", action="store_true",
+                    help="serve a live preview of the PI's camera + detections at http://<pi-ip>:PORT "
+                         "(great for demos -- open it on a phone/laptop on the same LAN)")
+    ap.add_argument("--web-port", type=int, default=8080,
+                    help="port for the --web live preview (default 8080)")
     args = ap.parse_args()
+    if args.no_track:
+        os.environ["SOUNDSIGHT_NO_TRACK"] = "1"   # read by VisionCore before the model loads
     if args.diag_imports:
         diag_imports()
     elif args.repair_venv:
@@ -1065,25 +1210,38 @@ def main():
                 log.info("Using compute server: %s", server_url)
             else:
                 log.warning("No compute server found -- running on-device.")
-        if args.remote_only or server_url or os.environ.get("COMPUTE_SERVER_URL"):
-            raise SystemExit(run_remote_only(server_url, args.camera_index))
+        server_url = server_url or os.environ.get("COMPUTE_SERVER_URL")
+
+        # --remote-only: everything on the laptop (Torch-free Pi). Explicit opt-in.
+        if args.remote_only:
+            raise SystemExit(run_remote_only(server_url, args.camera_index,
+                                             show=args.show, web=args.web, web_port=args.web_port))
+
+        # Otherwise we want the HYBRID: the Pi runs the light Navigate model locally and
+        # offloads only the heavy on-demand features (Read/Money/Describe/Faces) to the
+        # laptop. That needs Torch on the Pi. If Torch is broken, fall back to remote-only
+        # (when a server is configured) so the demo still runs.
         ok, err = torch_import_ok()
         if not ok:
-            log.error("Torch can't be imported on this Pi, so local AI mode cannot start.")
             if "null bytes" in err or "source code string cannot contain" in err:
-                # Corrupted file on disk -- the fast, exact fix is reinstalling it.
-                log.error("Cause: a Python file in the venv is corrupted (NUL bytes) -- usually an")
-                log.error("interrupted pip install or a failing SD card, NOT a version problem.")
+                log.error("Torch import fails: a venv file is corrupted (NUL bytes).")
                 log.error("FIX IT IN PLACE:  python pi_app.py --repair-venv")
-                log.error("(or scan first:    python pi_app.py --scan-corrupt)")
-            else:
-                log.error("For on-device mode, rebuild the Pi venv with a Python/Torch combination "
-                          "that imports cleanly (bash setup_pi.sh).")
-            log.error("MEANWHILE, run with the laptop doing detection:")
+            elif err.strip():
+                log.error("Torch can't be imported on this Pi: %s", err.strip().splitlines()[-1])
+                log.error("Rebuild the venv cleanly:  bash setup_pi.sh")
+            if server_url:
+                log.warning("Torch is unavailable -> falling back to REMOTE-ONLY (all detection on the laptop).")
+                raise SystemExit(run_remote_only(server_url, args.camera_index,
+                                                 show=args.show, web=args.web, web_port=args.web_port))
+            log.error("No compute server either. Start one and use --find-server:")
             log.error("  laptop:  python server.py --lan")
             log.error("  Pi:      python pi_app.py --find-server")
             raise SystemExit(1)
-        run(server_url, args.camera_index)
+
+        if server_url:
+            log.info("HYBRID mode: Pi runs Navigate locally, offloads heavy features to %s", server_url)
+        run(server_url, args.camera_index, show=args.show, web=args.web, web_port=args.web_port,
+            no_enhance=args.no_enhance)
 
 
 if __name__ == "__main__":

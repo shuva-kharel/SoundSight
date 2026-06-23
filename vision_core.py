@@ -706,7 +706,14 @@ class VisionCore:
         self.model = self._load_model()
         self.names = self.model.names
         self.tracker = TemporalTracker()
-        self._use_tracking = True  # flips to False if track() isn't supported
+        # Tracking uses ByteTrack, which pulls the native `lap` extension. On a Pi
+        # with a mismatched native stack that can ABORT the process (SIGABRT, which
+        # Python can't catch). SOUNDSIGHT_NO_TRACK=1 runs predict()-only (no lap) so
+        # detection still works -- you lose stable track_ids (urgency/announce fall
+        # back to per-(label,zone) keys). Defaults to tracking ON.
+        self._use_tracking = os.environ.get("SOUNDSIGHT_NO_TRACK", "0") not in ("1", "true", "True")
+        if not self._use_tracking:
+            log.info("Tracking DISABLED (SOUNDSIGHT_NO_TRACK) -- predict()-only, no lap/ByteTrack.")
         self.frame_count = 0
         self.enhance_frames = ENHANCE_FRAMES
         self._last_assess = None

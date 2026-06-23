@@ -14,7 +14,10 @@ torchvision
 
 ultralytics          # YOLO (torch already satisfied above, so it won't pull CUDA)
 opencv-python-headless # camera + image ops without GUI/Qt libs (less crashy on headless Pi)
-numpy
+# numpy<2: the prebuilt aarch64 wheels for opencv/lap/torchvision/scipy are compiled
+# against the numpy 1.x C-ABI. Under numpy 2.x they segfault / "corrupted double-linked
+# list" at runtime in native code. Pin <2 so the whole native stack stays ABI-consistent.
+numpy<2
 easyocr              # Read mode OCR (Nepali + English); downloads models on first use
 vosk                 # offline speech recognition (download a model -- see README_PI.md)
 sounddevice          # microphone capture for Vosk (apt needs portaudio19-dev)

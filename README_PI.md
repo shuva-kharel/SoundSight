@@ -98,8 +98,30 @@ python pi_app.py --reinstall-ml   # reinstalls matched CPU torch+torchvision, th
 python pi_app.py --selftest       # confirm 'model load + infer' now PASS
 ```
 
-`--reinstall-ml` pulls the CPU wheels from PyTorch's CPU index. If it's still
-unhealthy afterward, it prints the piwheels (Raspberry-Pi CPU) fallback command.
+`--reinstall-ml` pins **numpy<2** and reinstalls the matched CPU wheels. If it's
+still unhealthy afterward, it prints the piwheels (Raspberry-Pi CPU) fallback command.
+
+### `Fatal Python error: Segmentation fault` (in OpenCV / numpy / scipy)
+
+Same root cause as the abort above: a **numpy-2 ABI mismatch**. The prebuilt aarch64
+wheels for `opencv`, `lap`, `torchvision` and `scipy` are compiled against numpy 1.x
+and **crash in native code under numpy 2.x** — and because it's heap corruption, the
+crash lands in a *different* library each run (`torchvision.nms`, then `lap`, then
+`cv2` in `enhance()`…). It's not catchable in Python (segfault/SIGABRT bypass
+`try/except`). The fix is the same:
+
+```bash
+python pi_app.py --check-ml     # runs NMS + lap + OpenCV ops, shows numpy version
+python pi_app.py --reinstall-ml # pins numpy<2 and rebuilds the native stack, re-verifies
+```
+
+The single most reliable manual fix is just pinning numpy:
+```bash
+pip install --no-cache-dir 'numpy<2' && python pi_app.py --check-ml
+```
+To run **right now** without fixing the stack, use the minimal crash-free path
+(no tracker, no OpenCV enhance): `python pi_app.py --no-track --no-enhance`.
+Fresh installs avoid all of this — `requirements_pi.txt` now pins `numpy<2`.
 
 ### torch segfaults / can't be fixed: run laptop-offload mode
 
@@ -161,18 +183,28 @@ frame, warms up, and auto-reopens a yanked/frozen cam. Voice: say **"hey sight �
 
 | Command                             | What it does                                                                                           |
 | ----------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| **Run modes**                       |                                                                                                        |
 | `python pi_app.py`                  | Run on-device (camera + NCNN model + offline TTS). Default.                                            |
-| `python pi_app.py --camera-index 0` | Run with a specific camera index (from `--list-cameras`). Also `CAMERA_INDEX=0`.                       |
-| `python pi_app.py --find-server`    | Auto-discover the laptop on the LAN and offload detection to it (no Torch on the Pi).                  |
-| `python pi_app.py --remote-only`    | Force laptop-offload mode (uses `COMPUTE_SERVER_URL`). Torch-free.                                     |
+| `python pi_app.py --find-server`    | **HYBRID**: Pi runs Navigate locally, offloads heavy features (Read/Money/Describe) to the laptop.     |
+| `python pi_app.py --remote-only`    | Force laptop-offload for ALL detection (uses `COMPUTE_SERVER_URL`). Torch-free Pi.                     |
+| **Run options** (combine with any run mode) |                                                                                                |
+| `--camera-index 0`                  | Open a specific camera index (from `--list-cameras`). Also `CAMERA_INDEX=0`.                           |
+| `--web` (`--web-port 8080`)         | Serve a **live preview of the Pi's camera + detections** at `http://<pi-ip>:8080` (for demos).         |
+| `--show`                            | Print detections to the Pi terminal each frame (text visibility).                                     |
+| `--no-track`                        | Run without the ByteTrack tracker (avoids the native `lap` crash); loses stable track ids.             |
+| `--no-enhance`                      | Skip the OpenCV CLAHE enhance step (avoids a cv2 segfault on a flaky native stack).                    |
+| **Diagnostics & repair**            |                                                                                                        |
 | `python pi_app.py --selftest`       | PASS/FAIL: camera frame, model load + infer, audio, offload, SoC temp.                                 |
 | `python pi_app.py --list-cameras`   | Probe camera indices 0–4 and report which one works.                                                   |
-| **Diagnostics & repair**            |                                                                                                        |
 | `python pi_app.py --diag-imports`   | Run native imports (numpy/cv2/torch/ultralytics) in isolated child procs to pinpoint a crash.          |
 | `python pi_app.py --scan-corrupt`   | Report venv files with NUL bytes (cause of `source code string cannot contain null bytes`). Read-only. |
 | `python pi_app.py --repair-venv`    | Reinstall the NUL-corrupted packages found above, then verify `import torch`.                          |
-| `python pi_app.py --check-ml`       | Show torch/torchvision versions + run the NMS op that triggers `corrupted double-linked list` aborts.  |
-| `python pi_app.py --reinstall-ml`   | Reinstall a matched **CPU** torch+torchvision to fix native inference aborts, then re-verify.          |
+| `python pi_app.py --check-ml`       | Check the native ops that crash (torchvision NMS, `lap`, OpenCV) + report numpy version.                |
+| `python pi_app.py --reinstall-ml`   | Fix native crashes: pin **numpy<2** and reinstall matched CPU torch/torchvision/lap/opencv, then verify. |
+
+Examples combining options:
+`python pi_app.py --find-server --web --camera-index 0` ·
+`python pi_app.py --no-track --no-enhance` (minimal crash-free on-device path).
 
 ### `server.py` (laptop)
 
@@ -195,21 +227,46 @@ frame, warms up, and auto-reopens a yanked/frozen cam. Voice: say **"hey sight �
 | `VOSK_MODEL_DIR`     | Path to a downloaded Vosk model dir (offline voice control).                                   |
 | `GEMINI_API_KEY`     | Enables online **Describe** (otherwise falls back to an offline detection summary).            |
 
+### Demo: show the Pi's camera on a screen
+
+`pi_app.py` is normally headless (audio only). Add `--web` to serve a **live page of
+the Pi's own camera feed with detection boxes** — open it on any phone/laptop on the
+same network. This streams FROM the Pi (MJPEG `<img>`), so plain `http://` works (no
+HTTPS needed) and it's the Pi doing the seeing, not the viewer's camera.
+
+```bash
+# Laptop (heavy lifting):
+python server.py --lan
+
+# Pi (light model local + offload heavy, with the live demo page):
+python pi_app.py --find-server --web --camera-index 0
+#   -> "Pi web preview LIVE -> open http://<pi-ip>:8080"
+```
+
+Then open **`http://<pi-ip>:8080`** on your phone/laptop: you'll see the Pi's video,
+boxes/labels, and a panel showing what it's currently announcing. The Pi runs Navigate
+itself; Read/Money/Describe offload to the laptop. (If the Pi's local Torch still
+aborts, this same command auto-falls back to remote-only so the demo still runs.)
+
 ### Common recipes
 
 ```bash
-# On-device, fully offline (camera on the Pi):
-python pi_app.py --camera-index 0
+# HYBRID for a demo: Pi sees + Navigates locally, offloads heavy work, shows a live page:
+python server.py --lan                          # laptop
+python pi_app.py --find-server --web            # Pi -> open http://<pi-ip>:8080
 
-# Pi camera, laptop does detection over the LAN:
-python server.py --lan                 # laptop
-python pi_app.py --find-server         # Pi (auto-finds the laptop)
+# On-device, fully offline (camera on the Pi), with the live page:
+python pi_app.py --camera-index 0 --web
 
-# Browser (phone/Pi) owns the camera, laptop does detection:
-python server.py --lan-web             # laptop, then open https://<laptop-ip>:8000
+# All detection on the laptop (Torch-free Pi), still showing the Pi camera page:
+python pi_app.py --remote-only --web            # needs COMPUTE_SERVER_URL or --find-server
+
+# Minimal crash-free on-device path (no tracker, no OpenCV enhance):
+python pi_app.py --no-track --no-enhance --web
 
 # Something broke after a power cut / bad SD card:
 python pi_app.py --selftest            # see which stage fails, follow its hint
 python pi_app.py --repair-venv         # 'null bytes' import errors
-python pi_app.py --reinstall-ml        # 'corrupted double-linked list' inference aborts
+python pi_app.py --reinstall-ml        # segfault / 'corrupted double-linked list' crashes
+pip install --no-cache-dir 'numpy<2'   # the usual one-line cure for native crashes
 ```
