@@ -28,6 +28,7 @@ import time
 
 import camera as cam
 import frame_quality as fq
+from remote import RemoteCompute, find_server
 from vision_core import (
     FPS_FLOOR,
     AnnouncementManager,
@@ -177,10 +178,12 @@ def soc_temp_c():
         return None
 
 
-def _build_dispatch(speaker, banknote, crossing_mon, mtally, shared):
+def _build_dispatch(speaker, banknote, crossing_mon, mtally, shared, remote):
     """Return on_command(text): parse a voice transcript and run the matching Pi
-    handler. Reuses the SAME parser (commands.py) and vision_core/crossing/money
-    logic as the laptop -- no duplicated command logic."""
+    handler. On-demand heavy features (Read/Money/Faces/Describe) OFFLOAD to the
+    laptop compute server when it's reachable, else fall back to the Pi's local
+    models. Navigate/crossing stay 100% local. Same parser (commands.py) as the
+    laptop -- no duplicated command logic."""
     from commands import parse_command
     from vision_core import describe_from_detections
 
@@ -192,7 +195,7 @@ def _build_dispatch(speaker, banknote, crossing_mon, mtally, shared):
         if _ocr["reader"] is None:
             import easyocr
             speaker.speak("Loading reader")
-            _ocr["reader"] = easyocr.Reader(["ne", "en"])
+            _ocr["reader"] = easyocr.Reader(["ne", "en"], gpu=False)   # Pi = CPU
         g = fq.read_preprocess(frame)
         lines = _ocr["reader"].readtext(g, detail=0)
         return " ".join(lines).strip() or "No readable text found."
@@ -224,20 +227,43 @@ def _build_dispatch(speaker, banknote, crossing_mon, mtally, shared):
         if a == "navigate":
             say("Navigating"); return
         if a == "describe":
-            say(describe_from_detections(dets, "en")); return
-        if a == "cross":
+            # OFFLOAD: laptop VLM/Gemini; fall back to a local detection summary.
+            r = remote.describe(frame, "en") if frame is not None else None
+            if r is None:
+                remote.note_fallback_once(speaker.speak)
+                r = describe_from_detections(dets, "en")
+            say(r); return
+        if a == "cross":     # ALWAYS local (safety, uses the local Navigate detections)
             say(crossing_mon.query(dets, frame)["text"] if frame is not None else "No view yet."); return
         if a == "read" or a == "label":
+            rr = remote.ocr(frame, label=(a == "label")) if frame is not None else None
+            if rr is not None:
+                say(rr.get("text", "No readable text found.")); return
+            remote.note_fallback_once(speaker.speak)
             say(ocr_read(frame)); return
         if a == "money":
             say("Hold the note steady")
-            say(banknote.classify_voted(sample_frames())["text"]); return   # temporal voting
+            frames = sample_frames()
+            rr = remote.money(frames)                       # OFFLOAD heavy detector
+            if rr is not None:
+                say(rr.get("text", "")); return
+            remote.note_fallback_once(speaker.speak)
+            say(banknote.classify_voted(frames)["text"]); return   # local temporal voting
         if a == "money_add":
             say("Hold the note steady")
-            r = banknote.classify_voted(sample_frames())
+            r = banknote.classify_voted(sample_frames())    # tally is local state
             if not r.get("ok"): say(r["text"]); return
             from money import class_to_value
             say(mtally.add(class_to_value(r["class"]), time.time())["text"]); return
+        if a == "money_count":
+            say("Counting the notes")
+            frames = sample_frames(8)
+            rr = remote.money_count(frames)                 # OFFLOAD multi-note
+            if rr is not None:
+                say(rr.get("text", "")); return
+            remote.note_fallback_once(speaker.speak)
+            from money import count_notes
+            say(count_notes(frames, banknote)["text"]); return   # local Path B
         if a == "money_total": say(mtally.total_spoken()["text"]); return
         if a == "money_clear": say(mtally.clear()["text"]); return
         if a == "money_undo":  say(mtally.undo()["text"]); return
@@ -249,17 +275,24 @@ def _build_dispatch(speaker, banknote, crossing_mon, mtally, shared):
             shared["find"] = (tgt or "").lower(); say("Looking for " + (tgt or "")); return
         if a == "repeat":
             speaker.speak(shared["last"] or "Nothing to repeat yet."); return
+        if a == "sos":
+            speaker.amp = 200   # max volume for the emergency alert
+            say("Emergency. This person needs help. Please assist."); return
         if a == "help":
-            say("You can say navigate, what's in front, read, how much, add this note, "
-                "total, can I cross, find, repeat, louder, slower, or stop."); return
-        # who/remember (faces) are laptop features; acknowledge politely on the Pi
-        if a in ("who", "remember"):
-            say("Face recognition is off on this device."); return
+            say("You can say navigate, what's in front, read, how much, add this note, total, "
+                "can I cross, find, repeat, louder, slower, stop, or for help say help me."); return
+        if a == "who":
+            rr = remote.faces(frame) if frame is not None else None   # OFFLOAD to laptop InsightFace
+            if rr is not None:
+                say(rr.get("text", "I don't recognize anyone here.")); return
+            say("Face recognition needs the laptop, which is offline."); return
+        if a == "remember":
+            say("Enrolling a face needs the laptop. Use it nearby and online."); return
 
     return on_command
 
 
-def run():
+def run(server_url=None):
     # NCNN nano on the Pi's CPU. (On a laptop this also works; it just exports the
     # NCNN model once on first run.) Swap mode="coco" for the plain .pt model.
     from crossing import CrossingMonitor
@@ -273,12 +306,20 @@ def run():
     speaker = Speaker()
     speak = speaker.speak
 
+    # Distributed compute: offload heavy on-demand AI to the laptop if reachable.
+    remote = RemoteCompute(server_url)
+    if remote.enabled:
+        log.info("Compute offload target: %s (checking...)", remote.url)
+        remote.health(force=True)
+    else:
+        log.info("No COMPUTE_SERVER_URL -- running fully on-device (offload disabled).")
+
     # voice command components (shared state updated each frame by the loop)
     banknote = BanknoteClassifier()
     crossing_mon = CrossingMonitor()
     mtally = MoneyTally()
     shared = {"frame": None, "dets": [], "find": None, "last": ""}
-    start_voice(_build_dispatch(speaker, banknote, crossing_mon, mtally, shared),
+    start_voice(_build_dispatch(speaker, banknote, crossing_mon, mtally, shared, remote),
                 on_partial=speaker.stop)   # on_partial -> barge-in
 
     cap, cam_index, backend = cam.find_camera()   # OS-aware, validated open
@@ -422,6 +463,18 @@ def selftest():
     check("audio (espeak-ng)", lambda: (
         bool(find_espeak()),
         find_espeak() or "MISSING -- sudo apt install espeak-ng (Pi) / winget (Windows)"))
+
+    def remote_check():
+        rc = RemoteCompute()
+        if not rc.enabled:
+            return True, "offload disabled (no COMPUTE_SERVER_URL) -- runs on-device"
+        import time as _t
+        t0 = _t.time()
+        ok = rc.health(force=True)
+        return True, (f"laptop ONLINE at {rc.url} ({(_t.time()-t0)*1000:.0f} ms round-trip)"
+                      if ok else f"laptop OFFLINE ({rc.url}) -- will run on-device")
+
+    check("compute offload", remote_check)
     temp = soc_temp_c()
     check("SoC temp", lambda: (True, f"{temp:.0f}C" if temp is not None else "N/A (not a Pi)"))
 
@@ -436,16 +489,25 @@ def selftest():
 def main():
     ap = argparse.ArgumentParser(description="SoundSight Raspberry Pi entrypoint")
     ap.add_argument("--selftest", action="store_true",
-                    help="check camera/model/audio and exit with a PASS/FAIL report")
+                    help="check camera/model/audio/offload and exit with a PASS/FAIL report")
     ap.add_argument("--list-cameras", action="store_true",
                     help="probe camera indices 0-4 (OS-aware backend) and exit")
+    ap.add_argument("--find-server", action="store_true",
+                    help="scan the LAN for the laptop compute server, then run using it")
     args = ap.parse_args()
     if args.list_cameras:
         cam.list_cameras()
     elif args.selftest:
         selftest()
     else:
-        run()
+        server_url = None
+        if args.find_server:
+            server_url = find_server()      # auto-discover on the subnet
+            if server_url:
+                log.info("Using compute server: %s", server_url)
+            else:
+                log.warning("No compute server found -- running on-device.")
+        run(server_url)
 
 
 if __name__ == "__main__":

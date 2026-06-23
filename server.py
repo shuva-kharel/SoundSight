@@ -33,7 +33,7 @@ import money as money_mod
 import nepali_phrases
 from crossing import CrossingMonitor
 from faces import FaceMatcher
-from vision_core import NE_ZONES, zone_for
+from vision_core import DEVICE, FEATURE_PROFILE, NE_ZONES, zone_for
 from vision_core import (
     AnnouncementManager,
     ApproachDetector,
@@ -88,6 +88,16 @@ tts_engine = OfflineTTS()
 # 'not trained' until you run train_banknote.py.
 banknote = BanknoteClassifier()
 
+# Optional banknote DETECTION model for multi-note counting (Path A). If absent,
+# /money/count falls back to Path B (contour segmentation + the classifier).
+banknote_detect = None
+for _p in (money_mod.BANKNOTE_DETECT_MODEL, "models/banknote_detect_ncnn_model"):
+    if Path(_p).exists():
+        from ultralytics import YOLO
+        banknote_detect = YOLO(_p, task="detect")
+        log.info("Money: banknote DETECTION model loaded from %s (multi-note Path A)", _p)
+        break
+
 # Latest Navigate detections, cached so Describe's OFFLINE fallback and the "can I
 # cross" voice command can use them WITHOUT re-running the shared tracking model
 # (which would corrupt Navigate's ByteTrack state). Updated by the Navigate loop.
@@ -111,10 +121,12 @@ def get_ocr_reader():
     if _ocr_reader is None:
         import easyocr  # imported here so startup stays fast
 
-        log.info("Initializing EasyOCR for Nepali + English (first use downloads the Devanagari model)...")
-        # 'ne' = Nepali (Devanagari script), 'en' = English. EasyOCR lets English
-        # ride along with the Devanagari model, so one reader handles both.
-        _ocr_reader = easyocr.Reader(["ne", "en"])
+        from vision_core import FEATURE_PROFILE, LAPTOP_OCR_GPU
+        gpu = (FEATURE_PROFILE == "laptop" and LAPTOP_OCR_GPU)
+        log.info("Initializing EasyOCR for Nepali + English (gpu=%s; first use downloads models)...", gpu)
+        # 'ne' = Nepali (Devanagari), 'en' = English -- one reader handles both.
+        # On the laptop this runs on the GPU (heavy/accurate); on the Pi it's CPU.
+        _ocr_reader = easyocr.Reader(["ne", "en"], gpu=gpu)
         log.info("EasyOCR ready.")
     return _ocr_reader
 
@@ -443,6 +455,63 @@ async def money(files: list[UploadFile] = File(...)):
     return result
 
 
+@app.get("/remote/health")
+def remote_health():
+    """Health check for the distributed-compute client (Pi). Reports the profile and
+    which heavy models are loaded so the Pi knows it reached a real GPU server."""
+    return {"ok": True, "profile": FEATURE_PROFILE, "device": DEVICE,
+            "models": {"detect": vision._stem, "imgsz": vision.imgsz, "half": vision.half,
+                       "banknote_detect": banknote_detect is not None}}
+
+
+@app.post("/remote/detect")
+async def remote_detect(file: UploadFile = File(...)):
+    """High-accuracy one-shot detection on the laptop GPU (heavy model). Returns the
+    detection list for the Pi to use. (The Pi's own Navigate stays local & light.)"""
+    frame = decode_jpeg(await file.read())
+    if frame is None:
+        return {"detections": []}
+    enhanced = fq.enhance(frame, vision.enhance_frames)
+    dets = await run_in_threadpool(vision.detect, enhanced, False)
+    return {"detections": [
+        {"label": d["label"], "confidence": d["confidence"], "box": d["box"],
+         "urgency": d.get("urgency"), "area_ratio": d.get("area_ratio")} for d in dets]}
+
+
+@app.post("/sos")
+async def sos(lat: str = Form(None), lon: str = Form(None)):
+    """Emergency. The browser already raised a loud LOCAL alert (works offline); this
+    is the ONLINE dispatch hook. By default it just logs -- wire a real channel here
+    (Twilio SMS / email / webhook) with credentials. Degrades gracefully: with no
+    channel configured, `dispatched` is False and the local alert is the fallback."""
+    loc = (f"{lat},{lon}" if lat and lon else "unknown")
+    maps = f"https://maps.google.com/?q={lat},{lon}" if lat and lon else None
+    log.warning("SOS TRIGGERED -- location: %s  %s", loc, maps or "")
+    # SWAP POINT: send an SMS/email/webhook to an emergency contact here.
+    return {"ok": True, "location": loc, "maps": maps, "dispatched": False}
+
+
+@app.post("/money/count")
+async def money_count(files: list[UploadFile] = File(...)):
+    """Count MULTIPLE notes in the frame burst and sum them. Path A (detection model)
+    if one is loaded, else Path B (contour + classifier). Temporal-stable: finalizes
+    only when the note-set is stable across the frames. Returns breakdown + total."""
+    frames = []
+    for f in files:
+        fr = decode_jpeg(await f.read())
+        if fr is not None:
+            frames.append(fq.enhance(fr, vision.enhance_frames))
+    if not frames:
+        return {"stable": True, "count": 0, "total": 0,
+                "text": "Could not read the camera image.", "text_ne": "क्यामेरा छवि पढ्न सकिएन।"}
+    t0 = time.time()
+    result = await run_in_threadpool(money_mod.count_notes, frames, banknote, banknote_detect)
+    log.info("Money count: total=%s count=%s stable=%s (%d frames) in %.2fs",
+             result.get("total"), result.get("count"), result.get("stable"),
+             len(frames), time.time() - t0)
+    return result
+
+
 @app.post("/command")
 async def command(text: str = Form(...), conf: float = Form(1.0)):
     """Parse a recognized voice transcript with the SHARED parser (commands.py) so
@@ -636,13 +705,27 @@ if __name__ == "__main__":
         action="store_true",
         help="run a PASS/FAIL check of model/OCR/TTS/Gemini and exit",
     )
+    parser.add_argument(
+        "--lan",
+        action="store_true",
+        help="COMPUTE SERVER mode: bind 0.0.0.0 so the Pi can offload to this laptop "
+             "over the LAN (implies --http; prints this machine's LAN IP)",
+    )
     args = parser.parse_args()
 
     if args.selftest:
         run_selftest()
 
+    # COMPUTE-SERVER mode: serve plain HTTP on all interfaces so the Pi can reach it.
+    if args.lan:
+        from remote import local_ip
+        ip = local_ip() or "<this-laptop-ip>"
+        log.info("COMPUTE SERVER (profile=%s) on http://0.0.0.0:8000", FEATURE_PROFILE)
+        log.info("Point the Pi at it:  export COMPUTE_SERVER_URL=http://%s:8000", ip)
+        log.info("(or run `python pi_app.py --find-server` on the Pi to auto-detect)")
+        uvicorn.run(app, host="0.0.0.0", port=8000)
     # Bind to localhost so the browser treats it as a secure context (getUserMedia).
-    if args.http:
+    elif args.http:
         log.info("Serving HTTP -> open http://localhost:8000")
         uvicorn.run(app, host="127.0.0.1", port=8000)
     else:

@@ -46,6 +46,25 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # and NEVER pass device="cuda" on the Pi. See VisionCore.__init__.
 IS_ARM = platform.machine().lower() in ("aarch64", "arm64", "armv7l", "armv8l")
 
+# =========================================================================== #
+# FEATURE PROFILE  --  auto-detected; gates HEAVY (laptop GPU) vs LIGHT (Pi) models
+# =========================================================================== #
+# "laptop" = a real GPU is present -> heavy, accurate models (used by the laptop app
+#            AND the compute server the Pi offloads to).
+# "pi"     = ARM / no CUDA -> light models only; heavy models NEVER load here.
+# Switching profiles needs NO code edits -- it's purely auto-detected here.
+FEATURE_PROFILE = "laptop" if (DEVICE == "cuda" and not IS_ARM) else "pi"
+
+# Per-feature model config. Dial size up/down here; lighter alternatives noted.
+# (The Pi's own models are fixed below and must not change.)
+LAPTOP_DETECT_MODEL = "yolo11m"   # heavy Navigate/detect. Lighter: "yolo11s"; bigger: "yolo11l" (8GB ok)
+LAPTOP_DETECT_IMGSZ = 640
+LAPTOP_DETECT_HALF = True         # FP16 on GPU: faster + ~half the VRAM
+LAPTOP_OCR_GPU = True             # EasyOCR on GPU (heavier models). PaddleOCR is an optional upgrade.
+LAPTOP_FACE_MODEL = "buffalo_l"   # InsightFace full model on GPU
+LAPTOP_VLM_MODEL = "llava"        # local Ollama VLM when offline; lighter: "moondream"; bigger: "qwen2-vl"
+PI_DETECT_ACCURACY = "fast"       # yolo11n NCNN @320 on CPU -- DO NOT change (the Pi's safety path)
+
 # Frame width used by the zone logic. detect_and_rank() keeps it in sync with the
 # actual frame it processes.
 FRAME_W = 416
@@ -689,21 +708,28 @@ class VisionCore:
         if self.mode == "coco-ncnn" and self.accuracy == "accurate":
             log.warning("Pi/NCNN can't run 'accurate' (yolo11m + TTA) -- using 'fast'.")
             self.accuracy = "fast"
+        # PROFILE-based model selection: laptop coco -> HEAVY (yolo11m@640 FP16);
+        # everything else (incl. the Pi's coco-ncnn) -> the per-accuracy light model.
+        if self.mode == "coco" and FEATURE_PROFILE == "laptop":
+            self._stem = LAPTOP_DETECT_MODEL
+            self.imgsz = LAPTOP_DETECT_IMGSZ
+            self.half = LAPTOP_DETECT_HALF and DEVICE == "cuda"
+        else:
+            self._stem = ACCURACY_WEIGHTS.get(self.accuracy, "yolo11s")
+            self.imgsz = ACCURACY_IMGSZ.get(self.accuracy, IMG_SIZE)
+            self.half = False
+        self.augment = ACCURACY_AUGMENT.get(self.accuracy, False)
         self.model = self._load_model()
         self.names = self.model.names
         self.tracker = TemporalTracker()
         self._use_tracking = True  # flips to False if track() isn't supported
         self.frame_count = 0
-        # Per-tier inference settings + the runtime-tunable enhance flag (perf guard
-        # on the Pi can drop imgsz / turn enhance off, then restore them).
-        self.imgsz = ACCURACY_IMGSZ.get(self.accuracy, IMG_SIZE)
-        self.augment = ACCURACY_AUGMENT.get(self.accuracy, False)
         self.enhance_frames = ENHANCE_FRAMES
         self._last_assess = None
         self._last_enhanced = False
-        log.info("Detection: mode=%s, accuracy=%s, imgsz=%d, augment=%s, device=%s, "
-                 "enhance=%s, DETECT_ALL=%s", self.mode, self.accuracy, self.imgsz,
-                 self.augment, DEVICE.upper(), self.enhance_frames, DETECT_ALL)
+        log.info("Detection: profile=%s, mode=%s, model=%s, imgsz=%d, half=%s, augment=%s, "
+                 "device=%s, DETECT_ALL=%s", FEATURE_PROFILE, self.mode, self._stem, self.imgsz,
+                 self.half, self.augment, DEVICE.upper(), DETECT_ALL)
         # Print the full class list so you can SEE exactly what the model can find.
         known = sorted(str(n).lower() for n in self.names.values())
         log.info("Model knows %d classes: %s", len(known), ", ".join(known))
@@ -725,7 +751,7 @@ class VisionCore:
         if self.mode == "oiv7":
             return YOLO("yolov8s-oiv7.pt")
 
-        stem = ACCURACY_WEIGHTS.get(self.accuracy, "yolo11s")
+        stem = self._stem
         if self.mode == "coco-ncnn":
             ncnn_dir = f"{stem}_ncnn_model"  # NCNN is much faster on the Pi's ARM CPU
             if not os.path.isdir(ncnn_dir):
@@ -735,7 +761,14 @@ class VisionCore:
         if self.mode != "coco":
             log.warning("Unknown MODEL_MODE '%s' -- using coco", self.mode)
             self.mode = "coco"
-        return YOLO(f"{stem}.pt")  # auto-downloads on first run
+        try:
+            return YOLO(f"{stem}.pt")  # auto-downloads on first run
+        except Exception as exc:   # heavy model OOM / download fail -> fall back lighter
+            if stem != "yolo11s":
+                log.warning("Heavy model %s failed (%s) -- falling back to yolo11s.", stem, exc)
+                self._stem, self.half = "yolo11s", False
+                return YOLO("yolo11s.pt")
+            raise
 
     def set_imgsz(self, imgsz):
         """Runtime imgsz change (Pi perf guard drops 320->256 under load)."""
@@ -746,7 +779,7 @@ class VisionCore:
     def _infer(self, frame_bgr):
         """Run persistent tracking (stable track_ids) if available, else predict()."""
         kw = dict(imgsz=self.imgsz, conf=PREDICT_CONF, device=DEVICE, augment=self.augment,
-                  iou=0.5, agnostic_nms=True, max_det=50, verbose=False)
+                  half=self.half, iou=0.5, agnostic_nms=True, max_det=50, verbose=False)
         if self._use_tracking:
             try:
                 return self.model.track(frame_bgr, persist=True, tracker="bytetrack.yaml", **kw)[0]
@@ -1003,9 +1036,39 @@ class SceneDescriber:
                         return text
                 except Exception as exc:
                     log.warning("Describe attempt %d failed: %s", attempt + 1, exc)
-        # offline graceful fallback -- always say something useful
+
+        # LAPTOP offline: try a LOCAL vision-language model via Ollama (no internet).
+        # The Pi never runs a VLM -- it offloads to the laptop's /remote/describe.
+        if FEATURE_PROFILE == "laptop":
+            vlm = self._ollama_describe(buf.tobytes(), lang)
+            if vlm:
+                log.info("Describe source: ollama (%s)", LAPTOP_VLM_MODEL)
+                return vlm
+
+        # graceful fallback -- always say something useful from the detections
         log.info("Describe source: offline fallback (from %d detections)", len(detections or []))
         return describe_from_detections(detections, lang)
+
+    def _ollama_describe(self, jpg_bytes, lang):
+        """Local VLM via Ollama (http://localhost:11434). Returns text or '' if Ollama
+        isn't running / the model isn't pulled. Config: LAPTOP_VLM_MODEL."""
+        try:
+            import base64
+            import json
+            import urllib.request
+
+            prompt = DESCRIBE_PROMPT + (" Respond ONLY in Nepali (Devanagari)." if lang == "ne" else "")
+            body = json.dumps({
+                "model": LAPTOP_VLM_MODEL, "prompt": prompt, "stream": False,
+                "images": [base64.b64encode(jpg_bytes).decode()],
+            }).encode()
+            req = urllib.request.Request("http://localhost:11434/api/generate", data=body,
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return (json.loads(r.read()).get("response") or "").strip()
+        except Exception as exc:
+            log.info("Ollama VLM unavailable (%s) -- run `ollama pull %s`?", exc, LAPTOP_VLM_MODEL)
+            return ""
 
 
 # --------------------------------------------------------------------------- #

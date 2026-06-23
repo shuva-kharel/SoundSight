@@ -32,10 +32,10 @@ ACTIONS = (
     "who", "remember",
     # label reading
     "label",
-    # money tally / change
-    "money_add", "money_total", "money_clear", "money_undo", "money_pay",
+    # money tally / change + multi-note count
+    "money_add", "money_total", "money_clear", "money_undo", "money_pay", "money_count",
     # meta
-    "help",
+    "help", "sos",
 )
 
 # Wake word (+ common mishearings; recognizers often hear "site/side" for "sight").
@@ -52,6 +52,8 @@ KEYWORDS = {
     # --- money tally (check these multi-word ones before single-note "money") ----
     "money_add":   ["add this note", "add note", "add this", "count this note", "add this one",
                     "नोट जोड", "यो जोड", "जोड"],
+    "money_count": ["count the notes", "count the money", "count notes", "count money",
+                    "count all", "how many notes", "count", "गन्नुहोस्", "नोट गन", "कति वटा नोट"],
     "money_total": ["total", "what's the total", "how much total", "grand total", "sum",
                     "कुल", "जम्मा", "कति भयो"],
     "money_clear": ["clear", "reset", "start over", "clear total", "खाली", "रिसेट", "सफा"],
@@ -95,6 +97,9 @@ KEYWORDS = {
     # --- repeat -----------------------------------------------------------------
     "repeat":      ["repeat", "say again", "say that again", "again", "come again",
                     "दोहोर्याउ", "फेरि भन", "फेरि"],
+    # --- emergency (check BEFORE help so "help me" -> SOS, not the command list) -
+    "sos":         ["sos", "help me", "emergency", "i need help", "call for help",
+                    "save me", "बचाउ", "आपत", "सहयोग चाहियो", "गुहार"],
     # --- help -------------------------------------------------------------------
     "help":        ["help", "what can you do", "what can i say", "commands", "options",
                     "मद्दत", "के गर्न सक्छौ", "के भन्न सक्छु"],
@@ -112,9 +117,9 @@ _STOPWORDS = {"my", "the", "a", "an", "please", "is", "at", "this", "that", "to"
 
 # Precedence: most specific / safety-relevant first.
 _ACTION_ORDER = [
-    "stop", "help", "remember", "money_add", "money_total", "money_clear", "money_undo",
-    "money_pay", "cross", "who", "label", "find", "money", "read", "navigate", "describe",
-    "louder", "softer", "slower", "faster", "repeat",
+    "stop", "sos", "help", "remember", "money_add", "money_count", "money_total",
+    "money_clear", "money_undo", "money_pay", "cross", "who", "label", "find", "money",
+    "read", "navigate", "describe", "louder", "softer", "slower", "faster", "repeat",
 ]
 
 

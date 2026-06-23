@@ -145,6 +145,113 @@ class MoneyTally:
                 "text_ne": f"{to_devanagari(price)} तिर्नुहोस्, फिर्ता {to_devanagari(change)}: {ne_b}।"}
 
 
+# =========================================================================== #
+# MULTI-NOTE counting (announce each note + sum). Two paths:
+#   A) a banknote DETECTION model (box + denomination per note) -- best, needs a
+#      detection-trained model (see train_banknote_detect.py).
+#   B) contour segmentation + the existing CLASSIFIER on each note-like crop --
+#      works with the current model, no retrain (less robust).
+# Temporal stability: the SET of notes must be stable across a majority of frames
+# before we finalize, so the total doesn't flicker mid-count.
+# =========================================================================== #
+MONEY_MODEL_TYPE = "classify"          # "detect" | "classify" (auto-flips to detect if a model loads)
+BANKNOTE_DETECT_MODEL = "models/banknote_detect.pt"  # or models/banknote_detect_ncnn_model/
+MIN_NOTE_AREA = 0.015                  # a note must fill >= this fraction of the frame
+NOTE_ASPECT = (1.5, 3.2)               # banknote long/short side ratio (~2:1)
+COUNT_FRAMES = 8                       # frames sampled for temporal stability
+COUNT_STABLE_FRAC = 0.55               # same note-set must appear in this fraction of frames
+
+
+def _note_candidates(frame):
+    """Path B: find note-like rectangles by contour + aspect. Returns [(box, crop)]."""
+    import cv2
+    import numpy as np
+    h, w = frame.shape[:2]
+    area = float(h * w)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 40, 140)
+    edges = cv2.dilate(edges, np.ones((7, 7), np.uint8), iterations=2)
+    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = []
+    for c in cnts:
+        if cv2.contourArea(c) < MIN_NOTE_AREA * area:
+            continue
+        (_, _), (rw, rh), _ = cv2.minAreaRect(c)
+        if min(rw, rh) < 8:
+            continue
+        if not (NOTE_ASPECT[0] <= max(rw, rh) / min(rw, rh) <= NOTE_ASPECT[1]):
+            continue
+        x, y, bw, bh = cv2.boundingRect(c)
+        crop = frame[y:y + bh, x:x + bw]
+        if crop.size:
+            out.append(((x, y, x + bw, y + bh), crop))
+    return out
+
+
+def detect_notes(frame, classifier=None, detect_model=None):
+    """All notes in ONE frame -> [{value, conf, box}]. Path A if detect_model given,
+    else Path B (contour + classifier with the high MONEY_CONF/margin gate)."""
+    if detect_model is not None:
+        res = detect_model.predict(frame, imgsz=640, verbose=False)[0]
+        out = []
+        for b in res.boxes:
+            name = detect_model.names[int(b.cls[0])]
+            conf = float(b.conf[0])
+            v = class_to_value(name)
+            from vision_core import MONEY_CONF as _MC
+            if v and conf >= _MC:
+                out.append({"value": v, "conf": round(conf, 3),
+                            "box": [float(x) for x in b.xyxy[0]]})
+        return out
+    if classifier is None or classifier.model is None:
+        return []
+    out = []
+    for box, crop in _note_candidates(frame):
+        name, conf, margin = classifier._classify_one(crop)
+        if classifier._gate(name, conf, margin):
+            out.append({"value": class_to_value(name), "conf": round(conf, 3), "box": list(box)})
+    return out
+
+
+def summarize_notes(notes):
+    """[{value,...}] -> spoken breakdown + total (EN + NE), with grouping/plurals."""
+    if not notes:
+        return {"stable": True, "count": 0, "total": 0,
+                "text": "No notes detected.", "text_ne": "कुनै नोट देखिएन।", "notes": []}
+    counts = Counter(n["value"] for n in notes)
+    total = sum(n["value"] for n in notes)
+    en_b, ne_b = breakdown_text(counts)
+    return {"stable": True, "count": len(notes), "total": total,
+            "text": f"{en_b}. Total {total} rupees.",
+            "text_ne": f"{ne_b}। जम्मा {to_devanagari(total)} रुपैयाँ।",
+            "notes": [{"value": n["value"], "conf": n.get("conf", 0)} for n in notes]}
+
+
+def count_notes(frames, classifier=None, detect_model=None):
+    """Temporal-stable multi-note count over `frames`. Finalizes only when the SAME
+    note-set wins a majority of frames; otherwise asks to hold steady. Logs the
+    per-frame sets, the chosen stable set, and the total."""
+    if not frames:
+        return summarize_notes([])
+    per_frame = []
+    for f in frames:
+        notes = detect_notes(f, classifier, detect_model)
+        per_frame.append((tuple(sorted(n["value"] for n in notes)), notes))
+    sets = Counter(k for k, _ in per_frame)
+    stable_key, n = sets.most_common(1)[0]
+    log.info("Money count: per-frame=%s | stable=%s (%d/%d) ",
+             [list(k) for k, _ in per_frame], list(stable_key), n, len(frames))
+    if n < COUNT_STABLE_FRAC * len(frames):
+        return {"stable": False, "count": None, "total": None,
+                "text": "Hold the notes steady, I'm counting.",
+                "text_ne": "नोटहरू स्थिर राख्नुहोस्, गन्दै छु।"}
+    notes = next(nz for k, nz in per_frame if k == stable_key)
+    res = summarize_notes(notes)
+    log.info("Money count: total=%d count=%d notes=%s", res["total"], res["count"],
+             [nn["value"] for nn in res["notes"]])
+    return res
+
+
 def classify_notes(frame, classifier, multi=False, grid=3, min_conf=TILE_CONF):
     """Bridge to the banknote classifier. Returns a list of {value, conf, class}.
 

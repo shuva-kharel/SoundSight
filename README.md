@@ -248,9 +248,43 @@ python pi_app.py --selftest    # camera opens + returns a frame, NCNN model, aud
 python pi_app.py --list-cameras  # probe camera indices 0-4 (OS-aware backend)
 ```
 
+## Model profiles (laptop = heavy, Pi = light)
+SoundSight auto-detects a **`FEATURE_PROFILE`** ([vision_core.py](vision_core.py)) — no
+code edits to switch:
+- **`laptop`** (a CUDA GPU is present): heavy, accurate models — Navigate uses
+  **yolo11m@640 FP16**, Read uses **EasyOCR on GPU**, Faces use **InsightFace
+  buffalo_l**, Describe falls back to a **local Ollama VLM** when offline. FP16
+  keeps VRAM small (yolo11m ≈ 75 MB). Dial models up/down via the `LAPTOP_*`
+  constants at the top of `vision_core.py` (each has a lighter alternative noted).
+- **`pi`** (ARM / no CUDA): the light path only — **yolo11n NCNN @320 on CPU**. Heavy
+  models never load here. Unchanged from before.
+
+## Distributed compute (Pi ⇄ laptop, optional)
+The wearable Pi can **offload heavy on-demand AI to the laptop GPU** over a LAN
+(phone or laptop hotspot), while the **real-time safety loop (Navigate) always stays
+local on the Pi**. If the laptop is unreachable, each feature **falls back to the
+Pi's own model** automatically (one spoken "using on-device mode" notice) — it never
+hangs or crashes.
+```bash
+# 1. on the LAPTOP: run the compute server on the LAN (binds 0.0.0.0, prints its IP)
+python server.py --lan
+
+# 2. on the PI: auto-find the laptop and run, or set the URL by hand
+python pi_app.py --find-server
+#   or:  export COMPUTE_SERVER_URL=http://<laptop-ip>:8000 && python pi_app.py
+
+# verify before the demo (reports laptop ONLINE + round-trip ms):
+python pi_app.py --selftest
+```
+Read / Money / Faces / Describe then run on the laptop GPU (fast, accurate), spoken on
+the Pi; Navigate stays smooth and local. The client is stdlib-only
+([remote.py](remote.py)) — no extra deps on the Pi. Internet is needed **only** for
+Gemini inside `/describe` (phone hotspot); the laptop uses a local Ollama VLM
+(`LAPTOP_VLM_MODEL`, e.g. `ollama pull llava`) when there's no internet.
+
 ## Logging
-On startup the backend prints which device YOLO uses (`CUDA` or `CPU`). During
-Navigate the 15-frame debug log adds **frame brightness + blur score**, whether
+On startup the backend prints the **profile** and which model loaded per feature.
+During Navigate the 15-frame debug log adds **frame brightness + blur score**, whether
 **enhance** ran, the imgsz, **why** each object was announced
 (`new/escalation/change/refresh`), OCR **mean confidence** per Read, and whether
 Describe used **Gemini or the offline fallback**.

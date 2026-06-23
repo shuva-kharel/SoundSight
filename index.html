@@ -53,12 +53,12 @@
     <button class="mode" id="btnMoney"    aria-pressed="false" accesskey="4">💵 Money</button>
     <button class="mode" id="btnRepeat"   accesskey="5">🔁 Repeat</button>
     <button class="mode" id="btnLang"     accesskey="6">🌐 Lang: Auto</button>
-    <button class="mode" id="btnVoice"    aria-pressed="false" accesskey="7">🎤 Voice</button>
+    <button class="mode" id="btnVoice"    aria-pressed="false" accesskey="7">🎙️ Assistant</button>
   </div>
 
   <div id="status" role="status" aria-live="assertive">Starting camera…</div>
   <div id="caption" aria-live="polite"></div>
-  <p class="hint">Keys: 1 Navigate · 2 Read · 3 Describe · 4 Money · 5 Repeat · 6 Language · 7 Voice · C Crossing · H Help · D Demo. Voice: say “hey sight …”.</p>
+  <p class="hint">Press 7 (or 🎙️ Assistant) for hands-free: Navigate runs, say “hey sight …” to switch modes. Keys: 1 Nav · 2 Read · 3 Describe · 4 Money · 5 Repeat · 6 Lang · C Crossing · H Help · D Demo. Emergency: “hey sight help me”.</p>
 
 <script>
 "use strict";
@@ -470,18 +470,23 @@ function initRecognition() {
   return r;
 }
 
+// ONE assistant toggle: starts Navigate (ambient default) AND voice together, so
+// the whole assistant comes alive with a single press. Turning it off stops both.
 function toggleVoice() {
   if (listening) {
     listening = false; if (recog) { try { recog.stop(); } catch (_) {} }
-    btnVoice.setAttribute("aria-pressed", "false"); btnVoice.textContent = "🎤 Voice";
-    setCaption(""); confirmSay("Voice off", "आवाज नियन्त्रण बन्द"); return;
+    btnVoice.setAttribute("aria-pressed", "false"); btnVoice.textContent = "🎙️ Assistant";
+    setCaption("");
+    stopEverything(); mode = null; updateButtons();   // stop ambient Navigate too
+    confirmSay("Assistant off", "सहायक बन्द"); return;
   }
   recog = initRecognition(); if (!recog) return;
   listening = true;
-  btnVoice.setAttribute("aria-pressed", "true"); btnVoice.textContent = "🎤 Voice: On";
+  btnVoice.setAttribute("aria-pressed", "true"); btnVoice.textContent = "🎙️ Assistant: On";
+  ensureNavigate();                                   // Navigate is the ambient default
   try { recog.start(); } catch (_) {}
-  confirmSay("Voice on. Say hey sight, then a command. Say hey sight help for options.",
-             "आवाज चालु। हे साइट भनेर आदेश दिनुहोस्।");
+  confirmSay("Assistant on, navigating. Say hey sight, then a command. Hey sight help for options.",
+             "सहायक चालु, हिँड्दै। हे साइट भनेर आदेश दिनुहोस्।");
 }
 
 async function onRecog(e) {
@@ -517,6 +522,7 @@ function runAction(cmd) {
     case "label":       confirmSay("Checking the label", "लेबल हेर्दै"); doRead(true); break;
     case "money":       confirmSay("Checking the note", "नोट हेर्दै"); doMoney(); break;
     case "money_add":   moneyTally("add"); break;
+    case "money_count": moneyCount(); break;
     case "money_total": moneyTally("total"); break;
     case "money_clear": moneyTally("clear"); break;
     case "money_undo":  moneyTally("undo"); break;
@@ -532,7 +538,40 @@ function runAction(cmd) {
     case "faster":      adjustRate(+0.15); break;
     case "slower":      adjustRate(-0.15); break;
     case "help":        sayHelp(); break;
+    case "sos":         doSOS(); break;
   }
+  // one-shot modes run OVER the ambient Navigate stream, so the assistant always
+  // returns to Navigate automatically (it was never stopped).
+}
+
+// --- SOS (emergency) -- works offline (loud local alert); online adds dispatch ---
+let sosActive = false;
+async function doSOS() {
+  if (sosActive) return;
+  sosActive = true;
+  voiceVolume = 1.0;                                   // maximum volume
+  setStatus("🆘 EMERGENCY — calling for help");
+  document.body.style.background = "#5a0000";          // visual alarm for bystanders
+  const en = "Emergency. This person needs help. Please assist.";
+  const ne = "आपतकाल। यो व्यक्तिलाई सहयोग चाहिन्छ। कृपया मद्दत गर्नुहोस्।";
+  for (let i = 0; i < 3; i++)                           // repeat, HAZARD interrupts all
+    say(langMode === "ne" ? ne : en, { lang: langMode === "ne" ? "ne" : "en", priority: PRI.HAZARD });
+
+  // Best-effort location + server dispatch -- degrades gracefully offline.
+  let coords = null;
+  try {
+    coords = await new Promise((res) => navigator.geolocation
+      ? navigator.geolocation.getCurrentPosition(
+          (p) => res({ lat: p.coords.latitude, lon: p.coords.longitude }), () => res(null), { timeout: 4000 })
+      : res(null));
+  } catch (_) {}
+  if (coords) setStatus(`🆘 EMERGENCY — location ${coords.lat.toFixed(4)}, ${coords.lon.toFixed(4)}`);
+  try {
+    const form = new FormData();
+    if (coords) { form.append("lat", coords.lat); form.append("lon", coords.lon); }
+    await fetch("/sos", { method: "POST", body: form });   // server hook (wire real SMS/contact)
+  } catch (_) {}                                            // offline -> local alert already spoke
+  setTimeout(() => { document.body.style.background = ""; sosActive = false; }, 8000);
 }
 
 function adjustVolume(d) {
@@ -545,8 +584,8 @@ function adjustRate(d) {
 }
 function sayHelp() {
   confirmSay(
-    "You can say: navigate, what's in front, read this, read the label, how much, add this note, total, can I cross, find my, who's here, repeat, louder, slower, or stop.",
-    "तपाईं भन्न सक्नुहुन्छ: हिँड, अगाडि के छ, पढ, लेबल पढ, कति, नोट जोड, कुल, बाटो काट, खोज, यहाँ को छ, दोहोर्याउ, ठूलो, ढिलो, वा रोक।");
+    "You can say: navigate, what's in front, read this, read the label, how much, add this note, total, can I cross, find my, who's here, repeat, louder, slower, stop, or for emergency say hey sight help me.",
+    "तपाईं भन्न सक्नुहुन्छ: हिँड, अगाडि के छ, पढ, लेबल पढ, कति, नोट जोड, कुल, बाटो काट, खोज, यहाँ को छ, दोहोर्याउ, ठूलो, ढिलो, रोक, वा आपतकालका लागि हे साइट बचाउ भन्नुहोस्।");
 }
 
 async function doCross() {
@@ -575,6 +614,26 @@ async function moneyTally(op, amount) {
     setStatus("💵 " + text);
     say(text, { lang, priority: PRI.ANSWER });
   } catch (_) { confirmSay("Money command failed", "आदेश असफल भयो"); }
+}
+
+// Money: count ALL notes in the frame and sum them (multi-note).
+async function moneyCount() {
+  if (!video.videoWidth) { confirmSay("Camera not ready", "क्यामेरा तयार छैन"); return; }
+  setStatus("💵 Counting notes — spread them out, hold steady…");
+  confirmSay("Counting the notes", "नोट गन्दै");
+  const form = new FormData();
+  for (let i = 0; i < MONEY_FRAMES; i++) {
+    form.append("files", await captureBlob(0.92), `c${i}.jpg`);
+    await new Promise((r) => setTimeout(r, MONEY_GAP_MS));
+  }
+  try {
+    const r = await (await fetch("/money/count", { method: "POST", body: form })).json();
+    const lang = effectiveLang();
+    const text = lang === "ne" ? (r.text_ne || r.text) : r.text;
+    lastResult = { text, lang };
+    setStatus("💵 " + text);
+    say(text, { lang, priority: PRI.ANSWER });
+  } catch (_) { confirmSay("Count failed", "गणना असफल भयो"); }
 }
 
 // Faces: "who's here" and "remember this person as {name}".
@@ -650,6 +709,7 @@ function checkFind(boxes) {
 }
 
 // DEMO mode: step the hero sequence on cue (key D) so a live demo can't stall.
+// Each press advances + announces the step, then runs the real handler.
 const DEMO = [
   { label: "Read a sign", run: () => doRead(false) },
   { label: "Crossing light", run: () => doCross() },
@@ -660,6 +720,7 @@ let demoIdx = 0;
 function nextDemo() {
   const step = DEMO[demoIdx % DEMO.length]; demoIdx++;
   setStatus(`🎬 DEMO ${((demoIdx - 1) % DEMO.length) + 1}/${DEMO.length}: ${step.label}`);
+  confirmSay("Demo: " + step.label, "डेमो: " + step.label);
   step.run();
 }
 
