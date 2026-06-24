@@ -27,6 +27,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 
 import commands
+import finder as finder_mod
 import frame_quality as fq
 import labels as labels_mod
 import money as money_mod
@@ -42,14 +43,23 @@ from vision_core import (
     QualityGate,
     SceneDescriber,
     VisionCore,
+    get_sub_mode,
+    how_far_phrase,
+    scan_area_phrase,
     select_announcements,
+    set_sub_mode,
 )
 
 # OCR tuning (the /ocr path).
-OCR_CONF = 0.30          # drop EasyOCR fragments below this per-box confidence
+OCR_CONF = 0.30          # drop OCR fragments below this per-box confidence
 OCR_RESCUE_CONF = 0.50   # if mean conf is under this (or empty), retry rotated 90/180/270
 OCR_ROI = True           # crop to the central region before OCR (focus on the held label)
 OCR_ROI_FRAC = 0.85      # keep this central fraction (gentle; lower it to crop more)
+# Engine: laptop defaults to PaddleOCR (PP-OCRv4, faster + better Devanagari) when
+# installed; otherwise EasyOCR. The Pi always uses EasyOCR (CPU). Both pre-warm at
+# startup so the FIRST Read is fast, never a 30 s model download.
+import os as _os
+OCR_ENGINE = _os.environ.get("OCR_ENGINE", "auto")   # "auto" | "paddle" | "easyocr"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -72,6 +82,33 @@ except ImportError:
 
 app = FastAPI(title="SoundSight")
 
+# CORS: allow the Pi's browser dashboard (any LAN origin) to call /remote/* directly.
+try:
+    from fastapi.middleware.cors import CORSMiddleware
+    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
+                       allow_headers=["*"], expose_headers=["X-Processing-Time"])
+except Exception as _exc:   # CORS is a nicety, never fatal
+    log.warning("CORS middleware not enabled: %s", _exc)
+
+# Live request accounting for /remote/ping (so the Pi dashboard can show what the
+# laptop is doing) + an X-Processing-Time header on every response.
+_inflight = {"n": 0}
+
+
+@app.middleware("http")
+async def _timing(request: Request, call_next):
+    _inflight["n"] += 1
+    t0 = time.time()
+    try:
+        resp = await call_next(request)
+    finally:
+        _inflight["n"] -= 1
+    ms = (time.time() - t0) * 1000.0
+    resp.headers["X-Processing-Time"] = f"{ms:.0f}"
+    if request.url.path.startswith("/remote/") and ms > 250:
+        log.warning("SLOW %s: %.0f ms (target <150ms)", request.url.path, ms)
+    return resp
+
 
 @app.exception_handler(Exception)
 async def graceful_error(request: Request, exc: Exception):
@@ -84,6 +121,39 @@ async def graceful_error(request: Request, exc: Exception):
         "text": "Sorry, that didn't work. Please try again.",
         "text_ne": "माफ गर्नुहोस्, त्यो भएन। फेरि प्रयास गर्नुहोस्।"})
 
+
+def _gpu_diagnostics():
+    """Loud, actionable check. Three outcomes: (1) GPU works -> log and return;
+    (2) CUDA reports available but the torch build lacks kernels for this GPU's arch
+    (e.g. RTX 50-series sm_120) -> it silently runs on CPU -> warn + fix; (3) no CUDA."""
+    reason = "no CUDA build / GPU not detected"
+    try:
+        import torch
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_name(0)
+            cap = torch.cuda.get_device_capability(0)
+            sm = f"sm_{cap[0]}{cap[1]}"
+            archs = torch.cuda.get_arch_list()
+            if sm in archs:
+                log.info("GPU: %s (%s, CUDA %s) -- GPU acceleration ACTIVE.", name, sm, torch.version.cuda)
+                return
+            reason = (f"{name} is {sm}, but this torch build only supports {archs} -- "
+                      f"so kernels fall back to CPU")
+    except Exception as exc:
+        reason = f"torch CUDA query failed: {exc}"
+    log.warning("=" * 64)
+    log.warning("RUNNING ON CPU -- the GPU is NOT accelerating inference.")
+    log.warning("  Why: %s.", reason)
+    log.warning("  Effect: detection runs the light CPU model (yolo11n@320); for full")
+    log.warning("  accuracy + speed + the depth distance model, enable the GPU.")
+    log.warning("  RTX 50-series (Blackwell/sm_120) needs the CUDA 12.8 torch build:")
+    log.warning("    pip uninstall -y torch torchvision")
+    log.warning("    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128")
+    log.warning("  Verify:  python -c \"import torch;print(torch.cuda.is_available(),torch.cuda.get_arch_list())\"")
+    log.warning("=" * 64)
+
+
+_gpu_diagnostics()
 
 # Load YOLO once at startup (logs which device it uses).
 vision = VisionCore()
@@ -114,7 +184,24 @@ for _p in (money_mod.BANKNOTE_DETECT_MODEL, "models/banknote_detect_ncnn_model")
 # Latest Navigate detections, cached so Describe's OFFLINE fallback and the "can I
 # cross" voice command can use them WITHOUT re-running the shared tracking model
 # (which would corrupt Navigate's ByteTrack state). Updated by the Navigate loop.
-latest_nav = {"detections": [], "t": 0.0, "cross": None}
+latest_nav = {"detections": [], "t": 0.0, "cross": None, "fw": 416}
+personal_db = finder_mod.PersonalObjectDB()   # personal-object embeddings (/find/register, /remote/find)
+
+
+def _say(text, ne=None):
+    """Wrap a plain string as a speak item (the browser/Pi speech shape)."""
+    return {"text": text, "text_ne": ne or text, "rate": 1.0,
+            "urgent": False, "urgency": "near"}
+
+
+def _finder_state(finder):
+    """Serialise ObjectFinder state for the browser HUD (pick-list + locked target)."""
+    return {
+        "state": finder.state,
+        "pick": [{"letter": p["letter"], "label": p["label"], "zone": p["zone"],
+                  "distance_m": p["distance_m"]} for p in finder.pick],
+        "target": (finder.target or {}).get("label"),
+    }
 NAV_FRESH_SECS = 5.0   # only use cached detections/crossing this recent
 
 # Server-side money tally (single-user demo). Voice/keys add notes & compute change.
@@ -124,24 +211,77 @@ tally = money_mod.MoneyTally()
 # installed (insightface / face_recognition) -- never blocks startup.
 face_matcher = FaceMatcher(enabled=True)
 
-# EasyOCR is heavy (downloads models on first use), so we build it lazily on the
-# first /ocr call instead of blocking server startup. Navigate works instantly.
+# OCR is pre-warmed in a background thread at startup (prewarm_ocr below) so the
+# FIRST Read is fast -- no 30 s model download surprise mid-demo. Still lazy-safe:
+# get_ocr_reader() builds it on demand if the warm-up hasn't finished yet.
 _ocr_reader = None
+_ocr_engine = None        # "paddle" | "easyocr" (which one actually loaded)
+
+
+class _PaddleReader:
+    """Adapter so PaddleOCR exposes the same readtext(img, detail=1) -> [(box,text,conf)]
+    interface EasyOCR uses, keeping _ocr_pass/_ocr_best unchanged."""
+
+    def __init__(self, gpu):
+        from paddleocr import PaddleOCR
+        # PP-OCRv4 multilingual handles Devanagari + Latin; angle classifier on.
+        self._ocr = PaddleOCR(use_angle_cls=True, lang="devanagari", use_gpu=gpu, show_log=False)
+
+    def readtext(self, img, detail=1):
+        out = self._ocr.ocr(img, cls=True) or []
+        rows = out[0] if out and isinstance(out[0], list) else out
+        res = []
+        for line in (rows or []):
+            try:
+                box, (text, conf) = line[0], line[1]
+                res.append((box, text, float(conf)))
+            except Exception:
+                continue
+        return res
 
 
 def get_ocr_reader():
-    global _ocr_reader
-    if _ocr_reader is None:
-        import easyocr  # imported here so startup stays fast
-
-        from vision_core import FEATURE_PROFILE, LAPTOP_OCR_GPU
-        gpu = (FEATURE_PROFILE == "laptop" and LAPTOP_OCR_GPU)
-        log.info("Initializing EasyOCR for Nepali + English (gpu=%s; first use downloads models)...", gpu)
-        # 'ne' = Nepali (Devanagari), 'en' = English -- one reader handles both.
-        # On the laptop this runs on the GPU (heavy/accurate); on the Pi it's CPU.
-        _ocr_reader = easyocr.Reader(["ne", "en"], gpu=gpu)
-        log.info("EasyOCR ready.")
+    global _ocr_reader, _ocr_engine
+    if _ocr_reader is not None:
+        return _ocr_reader
+    from vision_core import FEATURE_PROFILE, LAPTOP_OCR_GPU
+    gpu = (FEATURE_PROFILE == "laptop" and LAPTOP_OCR_GPU)
+    want_paddle = OCR_ENGINE == "paddle" or (OCR_ENGINE == "auto" and FEATURE_PROFILE == "laptop")
+    if want_paddle:
+        try:
+            log.info("Initializing PaddleOCR (PP-OCRv4, devanagari, gpu=%s)...", gpu)
+            _ocr_reader = _PaddleReader(gpu)
+            _ocr_engine = "paddle"
+            log.info("PaddleOCR ready.")
+            return _ocr_reader
+        except Exception as exc:
+            log.warning("PaddleOCR unavailable (%s) -- falling back to EasyOCR.", exc)
+    import easyocr
+    log.info("Initializing EasyOCR for Nepali + English (gpu=%s)...", gpu)
+    _ocr_reader = easyocr.Reader(["ne", "en"], gpu=gpu)   # one reader handles both scripts
+    _ocr_engine = "easyocr"
+    log.info("EasyOCR ready.")
     return _ocr_reader
+
+
+def prewarm_ocr():
+    """Load the OCR model in a background thread at startup so the first Read is fast."""
+    import threading
+
+    def _warm():
+        try:
+            log.info("Pre-warming OCR model (one-time, in background)...")
+            get_ocr_reader()
+            log.info("OCR pre-warmed and READY (engine=%s).", _ocr_engine)
+        except Exception as exc:
+            log.warning("OCR pre-warm failed (%s) -- will retry on first Read.", exc)
+
+    threading.Thread(target=_warm, daemon=True).start()
+
+
+@app.on_event("startup")
+async def _startup_prewarm():
+    prewarm_ocr()
 
 
 def detect_lang(text: str) -> str:
@@ -187,13 +327,45 @@ async def ws_navigate(ws: WebSocket):
     approach = ApproachDetector()    # per-connection approach-history state
     gate = QualityGate()             # per-connection bad-frame guard
     crossing_mon = CrossingMonitor() # per-connection traffic-light state
+    from finder import ObjectFinder
+    finder = ObjectFinder(profile="laptop")  # per-connection Object Finder state
+    last_dets = []                   # most recent detections (for find-by-class/room)
     greeted = set()                  # track_ids already greeted by name this session
     frames, t0 = 0, time.time()
     log.info("Navigate client connected.")
 
+    async def _control(msg):
+        """Handle a Find-mode control message from the browser; returns a speak item
+        to send back, or None."""
+        cmd = msg.get("cmd")
+        now = time.time()
+        finder.set_frame_w(latest_nav.get("fw") or 416)
+        if cmd == "find_start":
+            return _say(finder.start_scan(now))
+        if cmd == "find_class":
+            conf = finder.find_class(msg.get("name", ""), last_dets, now)
+            return _say(conf or (f"I don't see a {msg.get('name')}. " + finder.start_scan(now)))
+        if cmd == "find_choose":
+            return _say(finder.choose(msg.get("pick", "")) or "Say the letter or the name.")
+        if cmd == "room":
+            return _say(finder.room_scan(last_dets))
+        if cmd == "find_exit":
+            finder.exit()
+            return _say("Find mode off.")
+        return None
+
     try:
         while True:
             text = await ws.receive_text()
+            # A control message is JSON ({"cmd": ...}); a frame is base64 (not JSON).
+            if text and text[0] == "{":
+                try:
+                    item = await _control(__import__("json").loads(text))
+                    await ws.send_json({"boxes": [], "speak": [item] if item else [],
+                                        "finder": _finder_state(finder)})
+                    continue
+                except Exception:
+                    pass
             frame = decode_b64_frame(text)
             if frame is None:
                 continue
@@ -214,8 +386,12 @@ async def ws_navigate(ws: WebSocket):
                     continue
 
                 detections = vision.detect(frame, assessment=assess)  # enhances internally
+                last_dets = detections
                 approaching = approach.approaching_objects(detections)
                 speak = select_announcements(detections, manager, approaching, now)
+                # In Find mode, ambient navigate yields -- only HAZARDS still interrupt.
+                if finder.active:
+                    speak = [s for s in speak if s.get("urgency") == "very close"]
 
                 # Known-face greetings: name confirmed person tracks (heavy -> only
                 # every N frames inside identify()), greet each new track once,
@@ -240,29 +416,54 @@ async def ws_navigate(ws: WebSocket):
                     greeted.intersection_update({d.get("track_id") for d in persons})
 
                 # Street-crossing sub-behavior: use the RAW frame for true light color
-                # (CLAHE would shift hues). Confirmed state changes are spoken first.
-                cross_ann = crossing_mon.update(detections, frame, now)
+                # (CLAHE would shift hues). Auto-announced ONLY in STREET sub-mode;
+                # confirmed state changes are spoken first.
+                street = get_sub_mode() == "street"
+                cross_ann = crossing_mon.update(detections, frame, now) if street else None
                 if cross_ann:
                     speak = [cross_ann] + speak
                 has_light = any(d["label"] == "traffic light" for d in detections)
                 latest_nav["cross"] = crossing_mon.query(detections, frame) if has_light else None
                 latest_nav["detections"], latest_nav["t"] = detections, now  # Describe/cross use these
+                latest_nav["free_space"] = getattr(vision.distance, "free_space_m", None)
+                latest_nav["fw"] = int(frame.shape[1])
+                finder.set_frame_w(frame.shape[1])
+
+                # --- Object Finder: scan -> pick-list -> guide + beacon -------- #
+                beacon = None
+                if finder.state == "scanning":
+                    res = finder.update_scan(detections, now)
+                    if res:
+                        speak = [_say(res[1])] + speak
+                elif finder.state == "tracking":
+                    g = finder.guide(detections, now)
+                    beacon = g["beacon"]
+                    if g["text"] and not any(s.get("urgency") == "very close" for s in speak):
+                        speak = [_say(g["text"])] + speak
 
                 await ws.send_json({
                     "boxes": [
                         {"label": d["label"], "confidence": d["confidence"],
-                         "box": d["box"], "urgency": d["urgency"]}
+                         "box": d["box"], "urgency": d["urgency"],
+                         "distance_m": d.get("distance_m"), "track_id": d.get("track_id")}
                         for d in detections
                     ],
                     "speak": speak,
                     "fw": int(frame.shape[1]),
                     "fh": int(frame.shape[0]),
                     "quality": assess,
+                    "sub_mode": get_sub_mode(),
+                    "light": crossing_mon.confirmed,
+                    "finder": _finder_state(finder),
+                    "beacon": beacon,
                 })
 
                 frames += 1
                 if frames % 30 == 0:
-                    fps = frames / (time.time() - t0)
+                    # WINDOWED fps (rate over the last 30 frames) -- not a cumulative
+                    # average, which would stay low forever after a slow startup.
+                    fps = 30 / (time.time() - t0)
+                    t0 = time.time()
                     log.info("Navigate FPS: %.1f  (last frame: %d detections, %s)",
                              fps, len(detections), assess["reason"])
             except WebSocketDisconnect:
@@ -477,6 +678,26 @@ def remote_health():
                        "banknote_detect": banknote_detect is not None}}
 
 
+@app.get("/remote/ping")
+def remote_ping():
+    """Lightweight status for the Pi dashboard: GPU, which models are loaded, and how
+    many requests are in flight right now (so judges can see what the laptop is doing)."""
+    return {
+        "status": "ok",
+        "gpu": DEVICE == "cuda",
+        "device": DEVICE,
+        "queue_depth": max(0, _inflight["n"] - 1),   # minus this ping itself
+        "models_loaded": {
+            "detect": vision._stem,
+            "depth": getattr(getattr(vision, "distance", None), "depth", None) is not None,
+            "ocr": _ocr_reader is not None,
+            "ocr_engine": _ocr_engine,
+            "faces": getattr(face_matcher, "available", False),
+            "banknote_detect": banknote_detect is not None,
+        },
+    }
+
+
 @app.post("/remote/detect")
 async def remote_detect(file: UploadFile = File(...)):
     """High-accuracy one-shot detection on the laptop GPU (heavy model). Returns the
@@ -489,7 +710,9 @@ async def remote_detect(file: UploadFile = File(...)):
     return {"detections": [
         {"label": d["label"], "confidence": d["confidence"], "box": d["box"],
          "urgency": d.get("urgency"), "area_ratio": d.get("area_ratio"),
-         "cx": d.get("cx"), "cy": d.get("cy")} for d in dets]}
+         "cx": d.get("cx"), "cy": d.get("cy"),
+         "distance_m": d.get("distance_m")} for d in dets],
+        "free_space_m": getattr(vision.distance, "free_space_m", None)}
 
 
 @app.post("/sos")
@@ -536,6 +759,77 @@ async def command(text: str = Form(...), conf: float = Form(1.0)):
     log.info("Voice: %r (conf=%.2f) -> action=%s target=%s wake=%s",
              text, conf, result["action"], result["target"], result["wake"])
     return result
+
+
+@app.post("/mode")
+async def mode(mode: str = Form(...)):
+    """Switch the Navigate sub-mode (street | public | home). Bilingual confirmation."""
+    m = set_sub_mode(mode)
+    if not m:
+        return {"ok": False, "text": "Unknown mode.", "text_ne": "अज्ञात मोड।", "sub_mode": get_sub_mode()}
+    ne = {"street": "सडक मोड", "public": "सार्वजनिक मोड", "home": "घर मोड"}[m]
+    log.info("Navigate sub-mode -> %s", m)
+    return {"ok": True, "text": f"{m.capitalize()} mode", "text_ne": ne, "sub_mode": m}
+
+
+@app.post("/howfar")
+async def howfar():
+    """'How far' -- nearest object distance + free-space ahead, from the latest
+    Navigate frame (no second inference). Distances are already metric on the laptop."""
+    fresh = (time.time() - latest_nav["t"]) < NAV_FRESH_SECS
+    dets = latest_nav["detections"] if fresh else []
+    en, ne = how_far_phrase(dets, getattr(vision, "distance", None), "en")
+    return {"text": en, "text_ne": ne, "urgent": False, "urgency": "near"}
+
+
+@app.post("/scan")
+async def scan():
+    """'Scan area' -- list what's around with rough positions + distances (PUBLIC mode)."""
+    fresh = (time.time() - latest_nav["t"]) < NAV_FRESH_SECS
+    dets = latest_nav["detections"] if fresh else []
+    en, ne = scan_area_phrase(dets, "en")
+    return {"text": en, "text_ne": ne, "urgent": False, "urgency": "near"}
+
+
+@app.post("/find/register")
+async def find_register(name: str = Form(...), file: UploadFile = File(...)):
+    """'Remember this as my {name}' -- store a feature embedding of the object in the
+    centre of the frame (laptop only; uses CLIP if available, else a colour histogram)."""
+    frame = decode_jpeg(await file.read())
+    if frame is None:
+        return {"ok": False, "text": "No image received."}
+    h, w = frame.shape[:2]
+    crop = frame[int(h * 0.2):int(h * 0.8), int(w * 0.2):int(w * 0.8)]   # centre region
+    ok, msg = await run_in_threadpool(personal_db.register, name, crop)
+    return {"ok": ok, "text": msg}
+
+
+@app.post("/remote/find")
+async def remote_find(name: str = Form(...), file: UploadFile = File(...)):
+    """Locate a PERSONAL object the Pi can't match locally: detect candidate boxes,
+    embed each crop, match against the stored embedding, return its position+distance."""
+    frame = decode_jpeg(await file.read())
+    if frame is None:
+        return {"found": False, "text": "No image received."}
+    if name not in personal_db.known():
+        return {"found": False, "text": f"I don't have your {name} saved yet."}
+    dets = await run_in_threadpool(vision.detect, frame, False)
+    crops, boxes = [], []
+    for d in dets:
+        x1, y1, x2, y2 = (int(max(0, v)) for v in d["box"])
+        c = frame[y1:min(frame.shape[0], y2), x1:min(frame.shape[1], x2)]
+        if c.size:
+            crops.append(c)
+            boxes.append(d)
+    idx, score = await run_in_threadpool(personal_db.match, name, crops)
+    if idx is None:
+        return {"found": False, "text": f"I don't see your {name} right now."}
+    d = boxes[idx]
+    z = zone_for(d["cx"])
+    dm = d.get("distance_m")
+    sp = (", " + __import__("distance").spoken_distance(dm)) if dm is not None else ""
+    return {"found": True, "text": f"Your {name} {z}{sp}.",
+            "box": d["box"], "cx": d["cx"], "distance_m": dm, "score": round(score, 2)}
 
 
 @app.post("/cross")
@@ -776,10 +1070,13 @@ if __name__ == "__main__":
     elif args.lan:
         from remote import local_ip
         ip = local_ip() or "<this-laptop-ip>"
-        log.info("COMPUTE SERVER (profile=%s) on http://0.0.0.0:8000", FEATURE_PROFILE)
-        log.info("Point the Pi at it:  export COMPUTE_SERVER_URL=http://%s:8000", ip)
-        log.info("(or run `python pi_app.py --find-server` on the Pi to auto-detect)")
-        log.info("For the browser web app on another device, use:  python server.py --lan-web (HTTPS)")
+        log.info("=" * 60)
+        log.info("Compute server ready at http://%s:8000 -- point Pi at this address.", ip)
+        log.info("  device=%s  detect=%s  (profile=%s)", DEVICE, vision._stem, FEATURE_PROFILE)
+        log.info("  Pi:  python pi_app.py --find-server   (auto-discovers this server)")
+        log.info("  or:  export COMPUTE_SERVER_URL=http://%s:8000", ip)
+        log.info("  Browser web app on another device:  python server.py --lan-web (HTTPS)")
+        log.info("=" * 60)
         uvicorn.run(app, host="0.0.0.0", port=8000)
     # Bind to localhost so the browser treats it as a secure context (getUserMedia).
     elif args.http:

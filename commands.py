@@ -28,6 +28,12 @@ ACTIONS = (
     "repeat", "stop", "louder", "softer", "slower", "faster",
     # street crossing
     "cross",
+    # distance / scan
+    "how_far", "scan",
+    # object finder
+    "find_mode", "track", "room_scan", "found",
+    # navigate sub-modes
+    "mode_street", "mode_public", "mode_home",
     # faces
     "who", "remember",
     # label reading
@@ -64,6 +70,28 @@ KEYWORDS = {
     "cross":       ["can i cross", "is it safe to cross", "traffic light", "should i cross",
                     "cross the road", "cross", "crossing", "light",
                     "बाटो काट", "काट्न", "ट्राफिक", "बत्ती", "हरियो बत्ती"],
+    # --- distance / scan --------------------------------------------------------
+    "how_far":     ["how far", "how far away", "how far is it", "how close", "distance",
+                    "how many meters", "how many metres", "how far ahead",
+                    "कति टाढा", "दूरी", "कति नजिक"],
+    "scan":        ["scan area", "scan the area", "scan", "scan around", "list everything",
+                    "what's around me", "whats around me", "वरिपरि स्क्यान", "स्क्यान", "वरिपरि के छ"],
+    # --- object finder ----------------------------------------------------------
+    "find_mode":   ["find mode", "finder", "find something", "rescan", "scan again",
+                    "scan for objects", "look for something", "फेला पार मोड", "खोज मोड"],
+    "room_scan":   ["what's in this room", "whats in this room", "what is in this room",
+                    "room scan", "scan the room", "what's in here", "whats in here",
+                    "यो कोठामा के छ", "कोठा स्क्यान"],
+    "found":       ["found it", "got it", "i found it", "i got it", "reached it",
+                    "भेटें", "पाएँ"],
+    "track":       ["track", "pick", "select", "choose", "option", "go to", "ट्र्याक", "रोज"],
+    # --- navigate sub-modes -----------------------------------------------------
+    "mode_street": ["street mode", "outdoor mode", "road mode", "outside mode",
+                    "सडक मोड", "स्ट्रिट मोड", "बाहिर मोड"],
+    "mode_public": ["public mode", "public place mode", "mall mode", "station mode",
+                    "सार्वजनिक मोड", "पब्लिक मोड"],
+    "mode_home":   ["home mode", "house mode", "indoor mode", "inside mode",
+                    "घर मोड", "होम मोड", "भित्र मोड"],
     # --- faces ------------------------------------------------------------------
     "remember":    ["remember this person", "remember this person as", "remember this face",
                     "save this person", "this person is", "यो मान्छे सम्झ", "नाम राख"],
@@ -109,6 +137,8 @@ KEYWORDS = {
 FIND_TRIGGERS = ["find my", "find the", "find a", "find", "where is my", "where is the",
                  "where is", "where's my", "where's", "locate my", "locate", "look for",
                  "खोज", "कहाँ छ"]
+# "track A" / "go to the cup" -> capture the letter or class after these
+TRACK_TRIGGERS = ["track", "pick", "select", "choose", "option", "go to", "रोज"]
 # "remember this person as Ram" / "this person is Ram" -> capture the name after these
 NAME_TRIGGERS = ["remember this person as", "remember this as", "remember this person",
                  "save this person as", "this person is", "name is", "call them",
@@ -118,7 +148,8 @@ _STOPWORDS = {"my", "the", "a", "an", "please", "is", "at", "this", "that", "to"
 # Precedence: most specific / safety-relevant first.
 _ACTION_ORDER = [
     "stop", "sos", "help", "remember", "money_add", "money_count", "money_total",
-    "money_clear", "money_undo", "money_pay", "cross", "who", "label", "find", "money",
+    "money_clear", "money_undo", "money_pay", "mode_street", "mode_public", "mode_home",
+    "cross", "scan", "how_far", "who", "label", "find", "money",
     "read", "navigate", "describe", "louder", "softer", "slower", "faster", "repeat",
 ]
 
@@ -146,7 +177,9 @@ def _has(t, words, keyword):
         return keyword in t
     if keyword in words:
         return True
-    if keyword.isascii():   # fuzzy only for ASCII (Devanagari needs exact-ish)
+    # Fuzzy only for ASCII words >=5 chars: short words (can/scan, on/son) collide
+    # at difflib's cutoff and cause dangerous mis-triggers (e.g. "can" -> "scan").
+    if keyword.isascii() and len(keyword) >= 5:
         return bool(difflib.get_close_matches(keyword, words, n=1, cutoff=0.85))
     return False
 
@@ -173,6 +206,23 @@ def _extract_amount(t):
     return m.group(0) if m else None
 
 
+def _extract_track_target(t):
+    """Capture the pick after a track trigger: a single LETTER ('a' for option A,
+    kept even though 'a' is normally a stopword) or a class name ('the cup' -> cup)."""
+    for trig in TRACK_TRIGGERS:
+        idx = t.find(trig)
+        if idx == -1:
+            continue
+        rest = t[idx + len(trig):].strip().split()
+        if not rest:
+            return None
+        if len(rest[0]) == 1 and rest[0].isalpha():     # letter pick (A/B/C...)
+            return rest[0]
+        rest = [w for w in rest if w not in _STOPWORDS]
+        return " ".join(rest[:3]) if rest else None
+    return None
+
+
 def parse_command(text):
     raw = text or ""
     t = _normalize(raw)
@@ -188,6 +238,16 @@ def parse_command(text):
         action, target = "remember", _extract_after(t, NAME_TRIGGERS)
     elif _match(t, words, "money_pay"):
         action, target = "money_pay", _extract_amount(t)
+    # finder: check BEFORE the find-trigger extraction so "find mode" / "rescan" /
+    # "what's in this room" aren't mis-parsed as find-a-thing.
+    elif _match(t, words, "find_mode"):
+        action = "find_mode"
+    elif _match(t, words, "room_scan"):
+        action = "room_scan"
+    elif _match(t, words, "found"):
+        action = "found"
+    elif _match(t, words, "track"):
+        action, target = "track", _extract_track_target(t)
     else:
         # find needs target extraction; try it before the generic single-word checks
         tgt = _extract_after(t, FIND_TRIGGERS)

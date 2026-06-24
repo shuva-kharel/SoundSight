@@ -27,7 +27,7 @@ import numpy as np
 log = logging.getLogger("soundsight.crossing")
 
 # --- config knobs ----------------------------------------------------------- #
-CONFIRM_FRAMES = 4        # same state must hold this many frames before announcing a change
+CONFIRM_FRAMES = 5        # same state must hold this many frames before announcing a change (hysteresis)
 MIN_AREA_RATIO = 0.004    # a light must fill at least this fraction of the frame (gate out
                           # distant lights so they don't trigger crossing guidance)
 MIN_LIT_FRACTION = 0.04   # the dominant color must be at least this fraction of the crop,
@@ -49,8 +49,8 @@ SAY = {
     "green":  ("Green light, looks clear to cross. Vehicles may still be moving, listen before you step.",
                "हरियो बत्ती, काट्न ठीक देखिन्छ। गाडी चलिरहेका हुन सक्छन्, पाइला चाल्नु अघि सुन्नुहोस्।"),
     "changed_stop": ("Light changed, stop and wait.", "बत्ती परिवर्तन भयो, रोकिनुहोस् र पर्खनुहोस्।"),
-    "unclear": ("Traffic light unclear, please be careful.", "ट्राफिक बत्ती अस्पष्ट छ, कृपया सावधान हुनुहोस्।"),
-    "none":    ("No traffic light seen, please be careful.", "ट्राफिक बत्ती देखिएन, कृपया सावधान हुनुहोस्।"),
+    "unclear": ("Traffic light unclear, be careful.", "ट्राफिक बत्ती अस्पष्ट छ, सावधान हुनुहोस्।"),
+    "none":    ("No traffic light visible.", "कुनै ट्राफिक बत्ती देखिएन।"),
 }
 
 

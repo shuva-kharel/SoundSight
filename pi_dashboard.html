@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SoundSight — Pi Dashboard</title>
+<style>
+  :root { color-scheme: dark; --green:#3fb950; --amber:#ffb300; --red:#ff3b3b; --bg:#0a0e13; --panel:#11161d; --line:#222b36; --txt:#e8eef5; --dim:#8a98a8; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font:16px/1.45 system-ui,sans-serif; }
+  #banner { display:none; background:var(--red); color:#fff; text-align:center; font-weight:800;
+            padding:8px; letter-spacing:.04em; font-size:18px; }
+  header { display:flex; align-items:center; gap:14px; padding:12px 18px; background:var(--panel);
+           border-bottom:1px solid var(--line); }
+  header h1 { font-size:20px; margin:0; }
+  .badge { padding:5px 14px; border-radius:16px; font-weight:800; font-size:15px; letter-spacing:.03em; }
+  .badge.mode { background:var(--green); color:#000; }
+  .badge.sub  { background:#1d2733; color:#9fb3c6; }
+  .grow { margin-left:auto; }
+  .pill { padding:5px 12px; border-radius:16px; font-weight:700; font-size:14px; }
+  .pill.online { background:var(--green); color:#000; } .pill.connecting{ background:var(--amber); color:#000; }
+  .pill.offline,.pill.disabled { background:#37424f; color:#cdd8e3; }
+  main { display:flex; gap:16px; padding:16px; flex-wrap:wrap; }
+  .video { flex:1 1 560px; min-width:320px; }
+  .video img { width:100%; border-radius:12px; background:#000; display:block; }
+  aside { flex:0 1 360px; min-width:280px; display:flex; flex-direction:column; gap:14px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px; }
+  .card h2 { margin:0 0 10px; font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); }
+  .row { display:flex; justify-content:space-between; gap:10px; padding:4px 0; }
+  .kpi { font-size:30px; font-weight:800; }
+  .light { width:26px; height:26px; border-radius:50%; background:#2a333d; display:inline-block; vertical-align:middle; }
+  .light.red{background:var(--red)} .light.amber{background:var(--amber)} .light.green{background:var(--green)}
+  ul { list-style:none; margin:0; padding:0; }
+  li { display:flex; justify-content:space-between; padding:5px 0; border-bottom:1px solid #1a212b; font-size:15px; }
+  .u-very.close,.u-very{ color:var(--red); font-weight:700; } .u-near{ color:var(--amber); } .u-far{ color:#8fb0cd; }
+  .spoken li { color:#cfe3f5; } .spoken .ts { color:var(--dim); font-variant-numeric:tabular-nums; }
+  .pick li b { color:var(--green); margin-right:6px; }
+  #ocr { white-space:pre-wrap; font-size:16px; color:#dfe9f3; min-height:1.4em; }
+  .target { color:#00d0ff; font-weight:700; }
+</style>
+</head>
+<body>
+  <div id="banner">⚠ LAPTOP OFFLINE — running locally on the Pi</div>
+  <header>
+    <h1>👁️ SoundSight</h1>
+    <span class="badge mode" id="mode">NAVIGATE</span>
+    <span class="badge sub" id="sub">STREET</span>
+    <span class="grow"></span>
+    <span class="pill" id="laptop">LAPTOP …</span>
+    <span class="pill" id="ocr">OCR …</span>
+    <span class="pill" id="fps">— FPS</span>
+  </header>
+
+  <main>
+    <div class="video"><img id="stream" src="/stream" alt="Pi live camera"></div>
+    <aside>
+      <div class="card" id="lightCard">
+        <h2>Traffic light</h2>
+        <div class="row"><span><span class="light" id="lightDot"></span> <span id="lightTxt">no light visible</span></span></div>
+      </div>
+      <div class="card" id="targetCard" style="display:none">
+        <h2>Find target</h2><div class="target" id="target">—</div>
+        <ul class="pick" id="pick"></ul>
+      </div>
+      <div class="card" id="ocrCard" style="display:none">
+        <h2>Read result</h2><div id="ocr"></div>
+      </div>
+      <div class="card">
+        <h2>Detections (distance)</h2>
+        <ul id="dets"><li><span class="u-far">starting…</span></li></ul>
+      </div>
+      <div class="card">
+        <h2>Spoken</h2>
+        <ul class="spoken" id="spoken"></ul>
+      </div>
+    </aside>
+  </main>
+
+<script>
+"use strict";
+function dist(m){ if(m==null) return ""; if(m<0.5) return "very close";
+  if(m<2) return "~"+(Math.round(m*4)/4)+" m"; return "~"+(Math.round(m*2)/2)+" m"; }
+const LIGHT={red:["RED","red"],amber:["AMBER","amber"],green:["GREEN","green"]};
+
+function render(s){
+  document.getElementById("mode").textContent = s.mode || "NAVIGATE";
+  document.getElementById("sub").textContent = (s.sub_mode||"street").toUpperCase();
+  document.getElementById("sub").style.display = (s.mode==="NAVIGATE"||!s.mode) ? "" : "none";
+  document.getElementById("fps").textContent = (s.fps? s.fps.toFixed(1):"—")+" FPS";
+
+  // laptop link
+  const link = s.laptop_link || "disabled";
+  const lp = document.getElementById("laptop");
+  lp.className = "pill "+link;
+  lp.textContent = link==="online" ? "LAPTOP ONLINE"+(s.laptop_ms!=null?" "+Math.round(s.laptop_ms)+"ms":"")
+                 : link==="connecting" ? "LAPTOP CONNECTING…"
+                 : link==="offline" ? "LAPTOP OFFLINE" : "LOCAL ONLY";
+  document.getElementById("banner").style.display = link==="offline" ? "block" : "none";
+
+  // OCR status
+  const ocrReady = s.ocr_ready;
+  const oc = document.getElementById("ocr");
+  oc.className = "pill "+(ocrReady?"online":"connecting");
+  oc.textContent = ocrReady ? "OCR READY" : "OCR LOADING…";
+
+  // traffic light
+  const dot=document.getElementById("lightDot"), txt=document.getElementById("lightTxt");
+  if(s.traffic_light && LIGHT[s.traffic_light]){ dot.className="light "+LIGHT[s.traffic_light][1]; txt.textContent=LIGHT[s.traffic_light][0]+" light"; }
+  else { dot.className="light"; txt.textContent="no light visible"; }
+
+  // find target + pick-list
+  const tc=document.getElementById("targetCard");
+  const pick=s.pick||[];
+  if(s.find_target || pick.length){ tc.style.display="block";
+    document.getElementById("target").textContent = s.find_target ? ("→ "+s.find_target) : "pick a letter";
+    document.getElementById("pick").innerHTML = pick.map(p=>`<li><span><b>${p.letter}</b>${p.label} ${p.zone}</span><span class="u-far">${dist(p.distance)}</span></li>`).join("");
+  } else tc.style.display="none";
+
+  // detections
+  document.getElementById("dets").innerHTML = (s.detections||[]).map(d=>{
+    const cls = "u-"+String(d.urgency||"far").replace(" ","-");
+    return `<li><span>${d.label}</span><span class="${cls}">${dist(d.distance)||d.urgency||""}</span></li>`;
+  }).join("") || '<li><span class="u-far">nothing in view</span></li>';
+
+  // spoken log
+  document.getElementById("spoken").innerHTML = (s.last_spoken||[]).slice().reverse()
+    .map(x=>`<li><span>${x.text}</span><span class="ts">${x.ts}</span></li>`).join("");
+
+  // OCR panel (show if a Read result was spoken)
+  const oce=document.getElementById("ocrCard");
+  const lastRead=(s.last_spoken||[]).slice().reverse().find(x=>/read|text|expiry|label/i.test(x.text));
+}
+
+// WebSocket with auto-reconnect
+let ws, retry=0;
+function connect(){
+  ws = new WebSocket((location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/status");
+  ws.onopen = ()=>{ retry=0; };
+  ws.onmessage = (e)=>{ try{ render(JSON.parse(e.data)); }catch(_){} };
+  ws.onclose = ()=>{ retry=Math.min(retry+1,10); setTimeout(connect, 300*retry); };
+  ws.onerror = ()=>{ try{ ws.close(); }catch(_){} };
+}
+connect();
+// keep the MJPEG <img> alive: if it errors (server restart), reload it
+document.getElementById("stream").onerror = function(){ const i=this; setTimeout(()=>{ i.src="/stream?"+Date.now(); }, 800); };
+</script>
+</body>
+</html>

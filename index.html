@@ -36,6 +36,23 @@
     max-width: 720px; margin: 4px auto; font-style: italic;
   }
   button.mode[aria-pressed="true"]#btnVoice { background: var(--ok); border-color: var(--ok); color:#000; }
+  #hud { display:flex; align-items:center; gap:8px; justify-content:center; flex-wrap:wrap;
+         max-width:720px; margin:6px auto; }
+  #hud .hud-label { color:#7d8a99; font-size:.9rem; }
+  .submode { padding:5px 12px; border-radius:14px; border:1px solid #2a3543; background:#161b22;
+             color:#9fb0c0; font-size:.85rem; cursor:pointer; }
+  .submode[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color:#000; font-weight:600; }
+  .light-pill { padding:4px 12px; border-radius:14px; font-weight:700; font-size:.85rem; }
+  .light-pill.red   { background:#ff1744; color:#fff; }
+  .light-pill.amber { background:#ffb300; color:#000; }
+  .light-pill.green { background:#00c853; color:#000; }
+  #findPanel { max-width:720px; margin:6px auto; background:#11161d; border:1px solid #2a3543;
+               border-radius:10px; padding:10px 14px; text-align:left; }
+  #findPanel #findHead { font-weight:700; color:var(--accent); margin-bottom:6px; }
+  #findPanel ul { list-style:none; margin:0 0 6px; padding:0; }
+  #findPanel li { padding:3px 0; font-size:1.05rem; }
+  #findPanel li b { display:inline-block; min-width:1.4em; color:#00d0ff; }
+  #findPanel .dim, #findPanel li .dim { color:#7d8a99; font-size:.85rem; }
 </style>
 </head>
 <body>
@@ -48,17 +65,27 @@
 
   <div id="controls">
     <button class="mode" id="btnNavigate" aria-pressed="false" accesskey="1">Navigate</button>
+    <button class="mode" id="btnFind"     aria-pressed="false" accesskey="f">🔍 Find</button>
     <button class="mode" id="btnRead"     aria-pressed="false" accesskey="2">Read</button>
     <button class="mode" id="btnDescribe" aria-pressed="false" accesskey="3">Describe</button>
     <button class="mode" id="btnMoney"    aria-pressed="false" accesskey="4">💵 Money</button>
     <button class="mode" id="btnRepeat"   accesskey="5">🔁 Repeat</button>
-    <button class="mode" id="btnLang"     accesskey="6">🌐 Lang: Auto</button>
-    <button class="mode" id="btnVoice"    aria-pressed="false" accesskey="7">🎙️ Assistant</button>
+    <button class="mode" id="btnLang"     accesskey="6">🌐 English</button>
+  </div>
+
+  <div id="hud">
+    <span id="lightPill" class="light-pill"></span>
+  </div>
+
+  <div id="findPanel" style="display:none">
+    <div id="findHead">Find</div>
+    <ul id="findList"></ul>
+    <div class="dim">F rescan · A–Z pick · R room scan · Esc exit</div>
   </div>
 
   <div id="status" role="status" aria-live="assertive">Starting camera…</div>
   <div id="caption" aria-live="polite"></div>
-  <p class="hint">Press 7 (or 🎙️ Assistant) for hands-free: Navigate runs, say “hey sight …” to switch modes. Keys: 1 Nav · 2 Read · 3 Describe · 4 Money · 5 Repeat · 6 Lang · C Crossing · H Help · D Demo. Emergency: “hey sight help me”.</p>
+  <p class="hint">Keys: 1 Navigate · F Find (then A–Z pick · R room scan · Esc exit) · 2 Read · 3 Describe · 4 Money · 5 Repeat · 6 Language (English/Nepali) · C Crossing · H Help.</p>
 
 <script>
 "use strict";
@@ -80,8 +107,8 @@ const btnRepeat = document.getElementById("btnRepeat");
 const send = document.createElement("canvas");
 const sctx = send.getContext("2d");
 
-const SEND_WIDTH = 640;      // frames sent at 640px wide so small objects (pens, etc.) survive
-const FRAME_MS   = 150;      // ~6-7 fps is plenty and keeps speech calm
+const SEND_WIDTH = 512;      // frames sent at this width: smaller = faster round-trip = less box lag
+const FRAME_MS   = 60;       // ~16 fps -- the GPU does detect in ~12ms, so push the rate for tight tracking
 
 let mode = null;             // "navigate" | "read" | "describe" | null
 let ws = null;
@@ -90,16 +117,14 @@ let lastFrame = { fw: SEND_WIDTH, fh: SEND_WIDTH };
 
 let lastResult = null;       // {text, lang} from the last Read/Describe -> used by Repeat
 let ttsAudio = null;         // <audio> currently playing a Nepali clip
-let langMode = "auto";       // "auto" = trust OCR detection | "en" | "ne" = force it
+let langMode = "en";         // "en" | "ne" -- toggled by the Language button
 
 const btnLang = document.getElementById("btnLang");
 
 function setStatus(msg) { statusEl.textContent = msg; }
 
-// Resolve which voice to use: the manual Language button overrides OCR's guess.
-function effectiveLang(detected) {
-  return langMode === "auto" ? (detected || "en") : langMode;
-}
+// Language is a manual English/Nepali toggle (no auto-detect).
+function effectiveLang(_detected) { return langMode; }
 
 // --- Unified PRIORITY speech queue -----------------------------------------
 // Only ONE thing speaks at a time, ranked: HAZARD (very-close / crossing) >
@@ -254,10 +279,27 @@ function sendFrame() {
   ws.send(send.toDataURL("image/jpeg", 0.6));
 }
 
+// Round a metric distance the same way the backend speaks it (0.25 m <2 m, 0.5 m >=2 m).
+function distLabel(m) {
+  if (m == null) return "";
+  if (m < 0.5) return "very close";
+  if (m < 2)  return "~" + (Math.round(m * 4) / 4) + " m";
+  return "~" + (Math.round(m * 2) / 2) + " m";
+}
+
+function updateHud(msg) {
+  const pill = document.getElementById("lightPill");
+  const L = { red: "RED", amber: "AMBER", green: "GREEN" };
+  if (msg.light && L[msg.light]) { pill.textContent = "● " + L[msg.light]; pill.className = "light-pill " + msg.light; }
+  else { pill.textContent = ""; pill.className = "light-pill"; }
+}
+
 function handleDetections(msg) {
   lastFrame = { fw: msg.fw, fh: msg.fh };
   drawBoxes(msg.boxes || []);
-  if (findTarget) checkFind(msg.boxes || []);   // active object-find guidance
+  updateHud(msg);
+  if (msg.finder) renderFinder(msg.finder);     // server-side finder: pick-list + target
+  beaconUpdate(msg.beacon);                      // audio beacon during Find guidance
 
   // speak is a list of {text, text_ne, rate, urgent, urgency}.
   const items = msg.speak || [];
@@ -300,7 +342,8 @@ function drawBoxes(boxes) {
     octx.lineWidth = b.urgency === "very close" ? 5 : 3;  // thicker = more urgent
     octx.strokeStyle = color;
     octx.strokeRect(x, y, w, h);
-    const label = `${b.label} ${(b.confidence * 100) | 0}%`;
+    const dl = distLabel(b.distance_m);
+    const label = `${b.label}${dl ? " " + dl : " " + ((b.confidence * 100) | 0) + "%"}`;
     octx.fillStyle = color;
     const tw = octx.measureText(label).width + 8;
     octx.fillRect(x, Math.max(0, y - 20), tw, 20);
@@ -425,12 +468,11 @@ function repeatLast() {
   speakResult(lastResult.text, lastResult.lang);
 }
 
-// --- Language button: Auto -> English -> Nepali (re-speaks last result) ------
-const LANG_CYCLE = ["auto", "en", "ne"];
+// --- Language button: English <-> Nepali (re-speaks last result) ------------
+const LANG_CYCLE = ["en", "ne"];
 const LANG_UI = {
-  auto: { btn: "🌐 Lang: Auto",    say: "Auto detect" },
-  en:   { btn: "🌐 Lang: English", say: "English" },
-  ne:   { btn: "🌐 Lang: नेपाली",  say: "Nepali" },
+  en:   { btn: "🌐 English", say: "English" },
+  ne:   { btn: "🌐 नेपाली",  say: "Nepali" },
 };
 function cycleLang() {
   langMode = LANG_CYCLE[(LANG_CYCLE.indexOf(langMode) + 1) % LANG_CYCLE.length];
@@ -445,7 +487,6 @@ function cycleLang() {
 // ===========================================================================
 const VOICE_CONF = 0.45;           // below this recognition confidence -> "say again"
 let recog = null, listening = false, requireWake = true;
-let findTarget = null, findState = { zone: null, close: null, t: 0 };
 const captionEl = document.getElementById("caption");
 const btnVoice  = document.getElementById("btnVoice");
 
@@ -528,11 +569,20 @@ function runAction(cmd) {
     case "money_undo":  moneyTally("undo"); break;
     case "money_pay":   moneyTally("pay", cmd.target); break;
     case "cross":       doCross(); break;
-    case "find":        startFind(cmd.target); break;
+    case "how_far":     doHowFar(); break;
+    case "scan":        doScan(); break;
+    case "mode_street": setSubMode("street"); break;
+    case "mode_public": setSubMode("public"); break;
+    case "mode_home":   setSubMode("home"); break;
+    case "find_mode":   enterFindMode(); break;
+    case "find":        findClass(cmd.target); break;
+    case "track":       chooseFind(cmd.target); break;
+    case "room_scan":   roomScan(); break;
+    case "found":       exitFindMode(); break;
     case "who":         doWho(); break;
     case "remember":    doRemember(cmd.target); break;
     case "repeat":      repeatLast(); break;
-    case "stop":        stopSpeech(true); exitFind(); setCaption(""); break;
+    case "stop":        stopSpeech(true); exitFindMode(); setCaption(""); break;
     case "louder":      adjustVolume(+0.15); break;
     case "softer":      adjustVolume(-0.15); break;
     case "faster":      adjustRate(+0.15); break;
@@ -584,8 +634,8 @@ function adjustRate(d) {
 }
 function sayHelp() {
   confirmSay(
-    "You can say: navigate, what's in front, read this, read the label, how much, add this note, total, can I cross, find my, who's here, repeat, louder, slower, stop, or for emergency say hey sight help me.",
-    "तपाईं भन्न सक्नुहुन्छ: हिँड, अगाडि के छ, पढ, लेबल पढ, कति, नोट जोड, कुल, बाटो काट, खोज, यहाँ को छ, दोहोर्याउ, ठूलो, ढिलो, रोक, वा आपतकालका लागि हे साइट बचाउ भन्नुहोस्।");
+    "You can say: navigate, what's in front, how far, scan area, street mode, public mode, home mode, read this, read the label, how much, add this note, total, can I cross, find my, who's here, repeat, louder, slower, stop, or for emergency say hey sight help me.",
+    "तपाईं भन्न सक्नुहुन्छ: हिँड, अगाडि के छ, कति टाढा, वरिपरि स्क्यान, सडक मोड, सार्वजनिक मोड, घर मोड, पढ, लेबल पढ, कति, नोट जोड, कुल, बाटो काट, खोज, यहाँ को छ, दोहोर्याउ, ठूलो, ढिलो, रोक, वा आपतकालका लागि हे साइट बचाउ भन्नुहोस्।");
 }
 
 async function doCross() {
@@ -596,6 +646,36 @@ async function doCross() {
     setStatus("🚦 " + text);
     say(text, { lang, priority: r.urgent ? PRI.HAZARD : PRI.ANSWER });
   } catch (_) { confirmSay("Could not check the crossing", "बाटो जाँच्न सकिएन"); }
+}
+
+async function doHowFar() {
+  try {
+    const r = await (await fetch("/howfar", { method: "POST" })).json();
+    const lang = effectiveLang();
+    const text = lang === "ne" ? (r.text_ne || r.text) : r.text;
+    setStatus("📏 " + text);
+    say(text, { lang, priority: PRI.ANSWER });
+  } catch (_) { confirmSay("Could not measure distance", "दूरी मापन गर्न सकिएन"); }
+}
+
+async function doScan() {
+  try {
+    const r = await (await fetch("/scan", { method: "POST" })).json();
+    const lang = effectiveLang();
+    const text = lang === "ne" ? (r.text_ne || r.text) : r.text;
+    setStatus("🧭 " + text);
+    say(text, { lang, priority: PRI.ANSWER });
+  } catch (_) { confirmSay("Could not scan", "स्क्यान गर्न सकिएन"); }
+}
+
+async function setSubMode(name) {
+  try {
+    const form = new FormData(); form.append("mode", name);
+    const r = await (await fetch("/mode", { method: "POST", body: form })).json();
+    for (const b of document.querySelectorAll(".submode"))
+      b.setAttribute("aria-pressed", String(b.dataset.mode === (r.sub_mode || name)));
+    confirmSay(r.text || `${name} mode`, r.text_ne || `${name} मोड`);
+  } catch (_) { confirmSay("Could not switch mode", "मोड बदल्न सकिएन"); }
 }
 
 async function moneyTally(op, amount) {
@@ -664,48 +744,71 @@ async function doRemember(name) {
   } catch (_) { confirmSay("Could not save that face", "अनुहार सेभ गर्न सकिएन"); }
 }
 
-// FIND mode: actively guide the user to an object, riding on the Navigate stream.
-function startFind(target) {
-  if (!target) { confirmSay("Find what?", "के खोज्ने?"); return; }
-  findTarget = target.toLowerCase();
-  findState = { zone: null, close: null, t: 0 };
-  confirmSay("Looking for " + target, "खोज्दै " + target);
-  ensureNavigate();
-}
-function exitFind() { findTarget = null; findState = { zone: null, close: null, t: 0 }; }
-function boxArea(b) { const [x1, y1, x2, y2] = b.box; return (x2 - x1) * (y2 - y1); }
+// FIND mode: driven by the SERVER-SIDE finder over the Navigate WebSocket (same
+// tested finder.py the Pi uses) -- scan -> pick-list -> lock -> beacon + guidance.
+// The browser just sends control messages and renders the finder state it gets back;
+// guidance lines arrive in msg.speak and are spoken by the normal queue.
+let finderState = "idle";   // idle | scanning | picking | tracking
 
-function checkFind(boxes) {
-  const matches = boxes.filter((b) => {
-    const l = (b.label || "").toLowerCase();
-    return l.includes(findTarget) || findTarget.includes(l);
-  });
-  if (!matches.length) {
-    if (Date.now() - findState.t > 4000) {           // rate-limited nudge
-      findState.t = Date.now();
-      confirmSay(`I don't see a ${findTarget}, try turning slowly`,
-                 `${findTarget} देखिएन, बिस्तारै घुम्नुहोस्`);
-    }
-    return;
+function wsSend(obj) {       // send a control message if the navigate WS is open
+  if (ws && ws.readyState === WebSocket.OPEN) { ws.send(JSON.stringify(obj)); return true; }
+  return false;
+}
+function whenNavOpen(fn, tries = 0) {   // ensure Navigate (the WS) is up, then run fn
+  ensureNavigate();
+  if (ws && ws.readyState === WebSocket.OPEN) fn();
+  else if (tries < 20) setTimeout(() => whenNavOpen(fn, tries + 1), 100);
+}
+function enterFindMode() { whenNavOpen(() => wsSend({ cmd: "find_start" })); finderState = "scanning"; }
+function findClass(t) {
+  if (!t) { confirmSay("Find what?", "के खोज्ने?"); return; }
+  whenNavOpen(() => wsSend({ cmd: "find_class", name: t.toLowerCase() }));
+}
+function chooseFind(t) { if (t) wsSend({ cmd: "find_choose", pick: String(t) }); }
+function roomScan() { whenNavOpen(() => wsSend({ cmd: "room" })); }
+function exitFindMode() { wsSend({ cmd: "find_exit" }); finderState = "idle"; beaconStop(); renderFinder(null); }
+
+// Render the finder pick-list + locked target from each frame's msg.finder, and
+// drive the audio beacon from msg.beacon.
+function renderFinder(f) {
+  const panel = document.getElementById("findPanel");
+  if (!f || f.state === "idle") { panel.style.display = "none"; finderState = "idle"; return; }
+  finderState = f.state;
+  panel.style.display = "block";
+  const head = document.getElementById("findHead");
+  if (f.state === "scanning") { head.textContent = "Scanning… hold still"; document.getElementById("findList").innerHTML = ""; }
+  else if (f.target) { head.textContent = "Tracking: " + f.target; document.getElementById("findList").innerHTML = ""; }
+  else {
+    head.textContent = "Pick a letter (or say it)";
+    document.getElementById("findList").innerHTML = (f.pick || []).map(p =>
+      `<li><b>${p.letter}</b> ${p.label} ${p.zone} <span class="dim">${distLabel(p.distance_m)}</span></li>`).join("");
   }
-  matches.sort((a, b) => boxArea(b) - boxArea(a));   // nearest/biggest first
-  const m = matches[0];
-  const [x1, , x2] = m.box;
-  const cx = (x1 + x2) / 2;
-  const ar = boxArea(m) / Math.max(lastFrame.fw * lastFrame.fh, 1);
-  const zone = cx < lastFrame.fw / 3 ? "on your left"
-             : cx > 2 * lastFrame.fw / 3 ? "on your right" : "ahead";
-  const close = ar > 0.20 ? "very" : ar > 0.05 ? "near" : "far";
-  if (zone === "ahead" && close === "very") {        // centered + close -> found, auto-exit
-    confirmSay(`${findTarget} right in front. Found it.`, `${findTarget} ठीक अगाडि। भेटियो।`);
-    exitFind(); return;
-  }
-  if (zone !== findState.zone || close !== findState.close) {   // announce on real change
-    findState.zone = zone; findState.close = close;
-    let phrase = `${findTarget} ${zone}`;
-    if (close === "near") phrase += ", getting closer";
-    say(phrase, { lang: "en", priority: PRI.ANSWER });
-  }
+}
+
+// --- Web Audio beacon: a beep whose interval shrinks as the target centers+nears ---
+let audioCtx = null, beaconTimer = null;
+function beep(freq = 880, dur = 0.05) {
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.frequency.value = freq; o.connect(g); g.connect(audioCtx.destination);
+    g.gain.setValueAtTime(0.18, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    o.start(); o.stop(audioCtx.currentTime + dur);
+  } catch (_) {}
+}
+function beaconDrive(b) {
+  if (!b || !b.active) { beaconStop(); return; }
+  const iv = Math.max(100, b.interval_ms || 500);
+  if (beaconTimer) return;                    // already running; the rate is set on next stop/start
+  const tick = () => { beep(); beaconTimer = setTimeout(tick, currentBeaconIv); };
+  currentBeaconIv = iv; tick();
+}
+let currentBeaconIv = 500;
+function beaconStop() { if (beaconTimer) { clearTimeout(beaconTimer); beaconTimer = null; } }
+function beaconUpdate(b) {                      // keep the interval current each frame
+  if (b && b.active) { currentBeaconIv = Math.max(100, b.interval_ms || 500); beaconDrive(b); }
+  else beaconStop();
 }
 
 // DEMO mode: step the hero sequence on cue (key D) so a live demo can't stall.
@@ -731,19 +834,28 @@ buttons.describe.addEventListener("click", () => setMode("describe"));
 buttons.money.addEventListener("click",    () => setMode("money"));
 btnRepeat.addEventListener("click", repeatLast);   // action, not a mode
 btnLang.addEventListener("click", cycleLang);
-if (btnVoice) btnVoice.addEventListener("click", toggleVoice);
+const btnFind = document.getElementById("btnFind");
+if (btnFind) btnFind.addEventListener("click", enterFindMode);
 
 document.addEventListener("keydown", (e) => {
+  if (e.target && /input|textarea/i.test(e.target.tagName)) return;
+  const k = e.key.toLowerCase();
+  // --- Find mode keys (take priority while Find is active) ------------------
+  if (k === "f") { enterFindMode(); return; }                 // F = enter / rescan
+  if (finderState !== "idle") {
+    if (e.key === "Escape" || k === "q") { exitFindMode(); return; }   // Esc/Q = exit
+    if (k === "r") { roomScan(); return; }                    // R = room scan
+    if (/^[a-z]$/.test(k) && finderState === "picking") { chooseFind(k); return; }  // A-Z = pick
+  }
   if (e.key === "1") setMode("navigate");
   else if (e.key === "2") setMode("read");
   else if (e.key === "3") setMode("describe");
-  else if (e.key === "4" || e.key.toLowerCase() === "m") setMode("money");
-  else if (e.key === "5" || e.key.toLowerCase() === "r") repeatLast();
-  else if (e.key === "6" || e.key.toLowerCase() === "l") cycleLang();
-  else if (e.key === "7" || e.key.toLowerCase() === "v") toggleVoice();
-  else if (e.key === "8" || e.key.toLowerCase() === "d") nextDemo();
-  else if (e.key.toLowerCase() === "c") doCross();
-  else if (e.key.toLowerCase() === "h") sayHelp();
+  else if (e.key === "4" || k === "m") setMode("money");
+  else if (e.key === "5") repeatLast();
+  else if (e.key === "6" || k === "l") cycleLang();
+  else if (e.key === "8") nextDemo();
+  else if (k === "c") doCross();
+  else if (k === "h") sayHelp();
 });
 
 // --- Camera startup ---------------------------------------------------------

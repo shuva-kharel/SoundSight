@@ -170,7 +170,9 @@ class FaceMatcher:
         """Attach det['name'] to matched person tracks. Runs only every FACE_EVERY_N
         frames and only for person tracks not already named (cached by track_id)."""
         now = now or time.time()
-        if not person_dets or not self.available:
+        # Nobody enrolled -> running face detection (heavy, esp. on CPU) is pure waste:
+        # there is no one to match. Skip entirely until at least one face is enrolled.
+        if not person_dets or not self.available or not self.db:
             return
         # prune stale track names; allow re-greet after REGREET_SECONDS away
         self._track_names = {tid: (n, t) for tid, (n, t) in self._track_names.items()

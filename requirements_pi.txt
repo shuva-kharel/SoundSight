@@ -22,6 +22,8 @@ easyocr              # Read mode OCR (Nepali + English); downloads models on fir
 vosk                 # offline speech recognition (download a model -- see README_PI.md)
 sounddevice          # microphone capture for Vosk (apt needs portaudio19-dev)
 piper-tts            # optional nicer offline TTS; espeak-ng (apt) is the default
+fastapi              # Pi live dashboard server (pi_server.py on :8080)
+uvicorn              # ASGI server for the dashboard (falls back to stdlib pi_web if absent)
 gpiozero             # optional: physical GPIO button to trigger modes
 python-dotenv        # loads GEMINI_API_KEY from .env (only if you want online Describe)
 #   google-genai     # online Describe (needs internet + GEMINI_API_KEY)

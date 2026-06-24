@@ -110,28 +110,87 @@ def distance_tier(d):
     return "far"
 
 
+def round_distance_m(d):
+    """Round per the SoundSight spec so we never speak raw floats:
+      < 0.5 m -> None (caller says 'very close')
+      < 2.0 m -> nearest 0.25 m
+      >= 2.0 m -> nearest 0.5 m
+    """
+    if d is None or d < 0.5:
+        return None
+    step = 0.25 if d < 2.0 else 0.5
+    return round(d / step) * step
+
+
+def _fmt_m(r):
+    """Format a rounded metre value: '1', '1.25', '2.5' (no trailing .0)."""
+    r = round(r, 2)
+    if abs(r - round(r)) < 1e-9:
+        return str(int(round(r)))
+    return f"{r:.2f}".rstrip("0").rstrip(".")
+
+
 def spoken_distance(d):
-    """Human, HONEST phrasing: rounded meters or steps. '' if unknown."""
+    """Human, HONEST phrasing: rounded meters or steps. '' if unknown.
+    NEVER a raw float -- rounded to 0.25 m (<2 m) / 0.5 m (>=2 m); 'very close'
+    under 0.5 m; 'right in front' within arm's reach."""
     if d is None:
         return ""
     if UNIT == "steps":
         n = max(1, round(d / STEP_M))
         return f"about {n} step" + ("s" if n != 1 else "")
+    if d < 0.5:
+        return "very close"
     if d < ARM_REACH:
         return "right in front"
-    return f"about {round(d)} meter" + ("s" if round(d) != 1 else "")
+    r = round_distance_m(d)
+    if r is None:
+        return "very close"
+    return f"about {_fmt_m(r)} meter" + ("s" if abs(r - 1.0) > 1e-9 else "")
+
+
+def nearest_with_distance(detections):
+    """The detection with the smallest known distance_m, or None."""
+    cand = [d for d in (detections or []) if d.get("distance_m") is not None]
+    return min(cand, key=lambda d: d["distance_m"]) if cand else None
 
 
 def spoken_distance_ne(d):
-    """Nepali (Devanagari) distance phrase. '' if unknown."""
+    """Nepali (Devanagari) distance phrase, same rounding as spoken_distance(). '' if unknown."""
     if d is None:
         return ""
-    dev = lambda n: str(int(n)).translate(str.maketrans("0123456789", "०१२३४५६७८९"))
+    dev = lambda s: str(s).translate(str.maketrans("0123456789", "०१२३४५६७८९"))
     if UNIT == "steps":
         return f"करिब {dev(max(1, round(d / STEP_M)))} पाइला"
+    if d < 0.5:
+        return "धेरै नजिक"
     if d < ARM_REACH:
         return "ठीक अगाडि"
-    return f"करिब {dev(round(d))} मिटर"
+    r = round_distance_m(d)
+    return f"करिब {dev(_fmt_m(r)) if r is not None else ''} मिटर".strip()
+
+
+def _is_clipped(box, frame_w, frame_h, margin=3):
+    """True if the box touches a frame edge -- the object continues out of view, so a
+    known-size geometric estimate (which needs the whole object) is unreliable."""
+    x1, y1, x2, y2 = box
+    return (x1 <= margin or y1 <= margin
+            or x2 >= frame_w - margin or y2 >= frame_h - margin)
+
+
+def _proximity_cap(area_ratio, clipped):
+    """Upper bound on distance (m) implied by how much of the frame a CLIPPED box
+    fills. A clipped box that fills the view is physically close, so this corrects the
+    geometric over-estimate at close range. Returns None when no cap applies."""
+    if not clipped or area_ratio is None:
+        return None
+    if area_ratio >= 0.50:
+        return 0.4     # fills the view -> within arm's reach
+    if area_ratio >= 0.32:
+        return 0.8
+    if area_ratio >= 0.18:
+        return 1.5
+    return None
 
 
 def _median_depth(depth, box):
@@ -226,10 +285,20 @@ class DistanceEstimator:
 
     def annotate(self, detections, frame, frame_idx=None):
         self._frame += 1
-        frame_w = frame.shape[1]
+        frame_h, frame_w = frame.shape[:2]
         # Tier 1: geometric for everyone (always)
         for d in detections:
             dm, rel = self.geo.estimate(d, frame_w)
+            # CLOSE-RANGE FIX: geometric assumes the WHOLE object is visible. A box that
+            # fills/clips the frame is only partly visible -> the height formula badly
+            # OVER-estimates (e.g. a face 30 cm away reads ~2 m). When the box is clipped
+            # at a frame edge AND large, cap the distance by how much of the view it fills.
+            clipped = _is_clipped(d["box"], frame_w, frame_h)
+            d["_clipped"] = clipped
+            if dm is not None:
+                cap = _proximity_cap(d.get("area_ratio"), clipped)
+                if cap is not None and dm > cap:
+                    dm, rel = cap, False    # capped distance isn't a trustworthy anchor
             d["distance_m"] = round(dm, 2) if dm is not None else None
             d["dist_reliable"] = rel
             d["dist_source"] = "geom" if dm is not None else None
@@ -241,10 +310,11 @@ class DistanceEstimator:
         if rel is None:
             return self.scale
 
-        # fuse: s = median( geometric_distance * relative_depth ) over reliable anchors
+        # fuse: s = median( geometric_distance * relative_depth ) over reliable anchors.
+        # Skip CLIPPED boxes -- their geometric distance is unreliable and would poison s.
         ratios = []
         for d in detections:
-            if not d.get("dist_reliable"):
+            if not d.get("dist_reliable") or d.get("_clipped"):
                 continue
             rd = _median_depth(rel, d["box"])
             if rd and rd > 1e-6 and d["distance_m"]:

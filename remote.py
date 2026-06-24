@@ -45,10 +45,15 @@ def _urlopen(req, timeout):
 # --- config (env-overridable so you don't edit code at the venue) ----------- #
 COMPUTE_SERVER_URL = os.environ.get("COMPUTE_SERVER_URL", "")  # e.g. http://192.168.1.50:8000
 REMOTE_ENABLED = os.environ.get("REMOTE_ENABLED", "1") not in ("0", "false", "False")
-REMOTE_TIMEOUT = float(os.environ.get("REMOTE_TIMEOUT", "3.0"))   # connect+read timeout (s)
-HEALTH_INTERVAL = 15.0     # re-check the server at most this often
-JPEG_QUALITY = 80          # send small JPEGs to keep WiFi payloads fast
-MAX_SEND_W = 960           # downscale wide frames before sending
+REMOTE_TIMEOUT = float(os.environ.get("REMOTE_TIMEOUT", "3.0"))   # default connect+read timeout (s)
+LIGHT_TIMEOUT = 1.5        # detect / faces: fast, never stall the realtime loop
+HEAVY_TIMEOUT = 5.0        # ocr / money / find: bigger models, bigger payloads
+DESCRIBE_TIMEOUT = 20.0    # VLM / Gemini caption can legitimately take longer
+HEALTH_INTERVAL = 5.0      # re-check the server at most this often (s)
+HEALTH_FAIL_LIMIT = 2      # consecutive failed checks before we declare OFFLINE (anti-flap)
+MAX_INFLIGHT_HEAVY = 2     # never pile up unbounded heavy work -- drop the request past this
+JPEG_QUALITY = 75          # send small JPEGs to keep WiFi payloads fast (latency cut)
+MAX_SEND_W = 640           # downscale wide frames before sending (latency cut)
 
 
 def _encode(frame, q=JPEG_QUALITY, max_w=MAX_SEND_W):
@@ -91,9 +96,46 @@ class RemoteCompute:
         self.timeout = timeout
         self.online = False
         self._last_check = 0.0
+        self._fail_count = 0          # consecutive health/call failures (2-strike)
+        self._offline_since = None
+        self.last_latency_ms = None   # last health round-trip (for the dashboard)
+        self._inflight_heavy = 0      # bounded so heavy work can't pile up
         self._announced_fallback = False
 
-    # --- health (cached) --------------------------------------------------- #
+    @property
+    def link_status(self):
+        """'online' | 'connecting' (degraded / not-yet-confirmed) | 'offline' | 'disabled'."""
+        if not self.enabled:
+            return "disabled"
+        if not self.online:
+            # never confirmed yet, or 1 strike = still trying; >=2 strikes = offline
+            return "offline" if self._fail_count >= HEALTH_FAIL_LIMIT else "connecting"
+        return "connecting" if self._fail_count > 0 else "online"
+
+    def _mark_ok(self, latency_ms=None):
+        was = self.online
+        self.online = True
+        self._fail_count = 0
+        self._offline_since = None
+        if latency_ms is not None:
+            self.last_latency_ms = latency_ms
+        if not was:
+            log.info("Compute server ONLINE: %s (%.0f ms round-trip)", self.url,
+                     latency_ms if latency_ms is not None else -1)
+        return True
+
+    def _mark_fail(self, reason=""):
+        """One strike. Only flip to OFFLINE after HEALTH_FAIL_LIMIT consecutive
+        failures, so a single dropped packet doesn't kill offloading (anti-flap)."""
+        self._fail_count += 1
+        if self._fail_count >= HEALTH_FAIL_LIMIT and self.online:
+            self.online = False
+            self._offline_since = time.time()
+            log.warning("Compute server OFFLINE after %d failed checks (%s) -- using local fallback.",
+                        self._fail_count, reason or "timeout")
+        return self.online
+
+    # --- health (cached, 2-strike) ---------------------------------------- #
     def health(self, force=False):
         if not self.enabled:
             return False
@@ -101,18 +143,15 @@ class RemoteCompute:
         if not force and (now - self._last_check) < HEALTH_INTERVAL:
             return self.online
         self._last_check = now
+        t0 = time.time()
         try:
-            with _urlopen(self.url + "/remote/health", timeout=1.5) as r:
+            with _urlopen(self.url + "/remote/health", timeout=LIGHT_TIMEOUT) as r:
                 info = json.loads(r.read())
-            was = self.online
-            self.online = bool(info.get("ok"))
-            if self.online and not was:
-                log.info("Compute server ONLINE: %s (profile=%s, detect=%s)",
-                         self.url, info.get("profile"), (info.get("models") or {}).get("detect"))
-            return self.online
-        except Exception:
-            self.online = False
-            return False
+            if info.get("ok"):
+                return self._mark_ok((time.time() - t0) * 1000)
+            return self._mark_fail("not ok")
+        except Exception as exc:
+            return self._mark_fail(str(exc))
 
     # --- raw calls --------------------------------------------------------- #
     def _post_json(self, path, fields=None, files=None, timeout=None):
@@ -133,40 +172,64 @@ class RemoteCompute:
         log.info("remote %s ok in %.0f ms", path, (time.time() - t0) * 1000)
         return txt
 
-    def _guard(self, fn):
-        """Run a remote call only if online; any error -> None (caller goes local)."""
+    def _guard(self, fn, heavy=False):
+        """Run a remote call only if online; any error -> None (caller goes local).
+        A failed call counts toward the 2-strike OFFLINE machine (not an instant flip).
+        Heavy calls are bounded (MAX_INFLIGHT_HEAVY) so they can't pile up unbounded."""
         if not self.health():
             return None
+        if heavy:
+            if self._inflight_heavy >= MAX_INFLIGHT_HEAVY:
+                log.info("remote heavy call dropped (queue full, %d in flight)", self._inflight_heavy)
+                return None
+            self._inflight_heavy += 1
         try:
-            return fn()
+            result = fn()
+            self._fail_count = 0          # a good call clears strikes
+            return result
         except Exception as exc:
             log.info("remote call failed (%s) -> falling back to local", exc)
-            self.online = False
+            self._mark_fail(str(exc))
             return None
+        finally:
+            if heavy:
+                self._inflight_heavy = max(0, self._inflight_heavy - 1)
 
     # --- features (None return => use the Pi's local model) ---------------- #
+    # heavy=True calls are bounded (drop past MAX_INFLIGHT_HEAVY); timeouts are
+    # per-endpoint so a slow link never stalls the realtime Navigate loop.
     def ocr(self, frame, label=False):
         return self._guard(lambda: self._post_json(
-            "/ocr", {"label": "true" if label else "false"}, [("file", "f.jpg", _encode(frame))]))
+            "/ocr", {"label": "true" if label else "false"},
+            [("file", "f.jpg", _encode(frame))], timeout=HEAVY_TIMEOUT), heavy=True)
 
     def money(self, frames):
         files = [("files", f"f{i}.jpg", _encode(f)) for i, f in enumerate(frames)]
-        return self._guard(lambda: self._post_json("/money", {}, files, timeout=max(self.timeout, 6)))
+        return self._guard(lambda: self._post_json("/money", {}, files, timeout=HEAVY_TIMEOUT), heavy=True)
 
     def money_count(self, frames):
         files = [("files", f"c{i}.jpg", _encode(f)) for i, f in enumerate(frames)]
-        return self._guard(lambda: self._post_json("/money/count", {}, files, timeout=max(self.timeout, 8)))
+        return self._guard(lambda: self._post_json("/money/count", {}, files, timeout=HEAVY_TIMEOUT), heavy=True)
 
     def faces(self, frame):
-        return self._guard(lambda: self._post_json("/faces/who", {}, [("file", "f.jpg", _encode(frame))]))
+        return self._guard(lambda: self._post_json(
+            "/faces/who", {}, [("file", "f.jpg", _encode(frame))], timeout=LIGHT_TIMEOUT))
+
+    def find(self, name, frame):
+        """Locate a PERSONAL object on the laptop (CLIP/feature match). None -> Pi can't."""
+        return self._guard(lambda: self._post_json(
+            "/remote/find", {"name": name}, [("file", "f.jpg", _encode(frame))],
+            timeout=HEAVY_TIMEOUT), heavy=True)
 
     def describe(self, frame, lang="en"):
         return self._guard(lambda: self._post_text(
-            "/describe", {"lang": lang}, [("file", "f.jpg", _encode(frame))], timeout=20))
+            "/describe", {"lang": lang}, [("file", "f.jpg", _encode(frame))],
+            timeout=DESCRIBE_TIMEOUT), heavy=True)
 
     def detect(self, frame):
+        # realtime path: short timeout so a slow frame is dropped, not queued.
         return self._guard(lambda: self._post_json(
-            "/remote/detect", {}, [("file", "f.jpg", _encode(frame))], timeout=max(self.timeout, 6)))
+            "/remote/detect", {}, [("file", "f.jpg", _encode(frame))], timeout=LIGHT_TIMEOUT))
 
     def note_fallback_once(self, speak):
         """Speak a subtle notice the FIRST time we fall back to on-device mode."""

@@ -95,6 +95,9 @@ CAM_FAIL_LIMIT = 45       # consecutive failed reads before we reopen the camera
 # downloaded model on the Pi (see README_PI.md). Cleanly disabled (not flaky) until
 # then. Set True (after installing those) to enable hands-free voice on the Pi.
 VOICE_ENABLED = False
+# Pre-load EasyOCR in a background thread at startup so the FIRST Read is fast (no
+# 30 s model download surprise mid-demo). Disable on a low-RAM Pi: PI_PREWARM_OCR=0.
+PREWARM_OCR = os.environ.get("PI_PREWARM_OCR", "1") not in ("0", "false", "False")
 PERF_WINDOW = 30          # measure FPS over this many frames for the perf guard
 IMG_SIZE_FULL = 320       # Pi "fast" tier imgsz...
 IMG_SIZE_LOW = 256        # ...dropped to this under load
@@ -143,6 +146,74 @@ class Speaker:
         elif action == "softer": self.amp = max(20, self.amp - 40)
         elif action == "faster": self.wpm = min(280, self.wpm + 30)
         elif action == "slower": self.wpm = max(90, self.wpm - 30)
+
+
+class Beacon:
+    """Find-mode audio beacon: short beeps whose interval the finder shrinks as the
+    target gets centered AND closer. Generates a tiny sine WAV once (stdlib, no
+    numpy) and plays it via `aplay` (alsa-utils). A daemon thread paces the beeps so
+    it never blocks the capture loop. Silently no-ops if aplay is missing."""
+
+    def __init__(self):
+        self.exe = shutil.which("aplay")
+        self._interval = None       # ms between beeps; None = silent
+        self._stop = False
+        self._wav = self._make_wav(880, 0.06) if self.exe else None
+        self._hi = self._make_wav(1320, 0.05) if self.exe else None
+        if self.exe and self._wav:
+            import threading
+            threading.Thread(target=self._loop, daemon=True).start()
+        elif not self.exe:
+            log.info("Beacon OFF (aplay not found; install alsa-utils for the find beep).")
+
+    def _make_wav(self, freq, secs):
+        import math
+        import struct
+        import tempfile
+        import wave
+        rate = 16000
+        path = os.path.join(tempfile.gettempdir(), f"ss_beacon_{freq}.wav")
+        try:
+            with wave.open(path, "w") as w:
+                w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
+                frames = bytearray()
+                for i in range(int(rate * secs)):
+                    val = int(32767 * 0.5 * math.sin(2 * math.pi * freq * i / rate))
+                    frames += struct.pack("<h", val)
+                w.writeframes(bytes(frames))
+            return path
+        except Exception:
+            return None
+
+    def _play(self, path):
+        try:
+            subprocess.Popen([self.exe, "-q", path],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+    def _loop(self):
+        while not self._stop:
+            iv = self._interval
+            if iv is None:
+                time.sleep(0.05)
+                continue
+            self._play(self._wav)
+            time.sleep(max(0.08, iv / 1000.0))
+
+    def update(self, beacon):
+        """beacon = {active, interval_ms} from ObjectFinder.guide()."""
+        self._interval = beacon.get("interval_ms") if beacon and beacon.get("active") else None
+
+    def off(self):
+        self._interval = None
+
+    def success(self):
+        """Two quick high beeps = found it."""
+        if self.exe and self._hi:
+            self._play(self._hi)
+            import threading
+            threading.Timer(0.12, lambda: self._play(self._hi)).start()
 
 
 # --------------------------------------------------------------------------- #
@@ -242,27 +313,46 @@ def camera_indices(camera_index):
     return (camera_index,) if camera_index is not None else (0, 1, 2)
 
 
-def _build_dispatch(speaker, banknote, crossing_mon, mtally, shared, fq, remote):
+def _build_dispatch(speaker, banknote, crossing_mon, mtally, shared, fq, remote, vision=None, vc=None):
     """Return on_command(text): parse a voice transcript and run the matching Pi
     handler. On-demand heavy features (Read/Money/Faces/Describe) OFFLOAD to the
     laptop compute server when it's reachable, else fall back to the Pi's local
-    models. Navigate/crossing stay 100% local. Same parser (commands.py) as the
-    laptop -- no duplicated command logic."""
+    models. Navigate/crossing/distance stay 100% local. Same parser (commands.py)
+    as the laptop -- no duplicated command logic."""
     from commands import parse_command
-    from vision_core import describe_from_detections
+    from vision_core import describe_from_detections, how_far_phrase, scan_area_phrase, set_sub_mode
+    finder_obj = shared.get("finder")
 
-    _ocr = {"reader": None}
+    def _ocr_pass(reader, img):
+        """One pass: drop fragments < 0.30 conf, order top->bottom, left->right."""
+        res = reader.readtext(img, detail=1)
+        good = [(b, t, c) for (b, t, c) in res if c >= 0.30 and t.strip()]
+        if not good:
+            return "", 0.0
+        good.sort(key=lambda r: (round(min(p[1] for p in r[0]) / 20), min(p[0] for p in r[0])))
+        return " ".join(t.strip() for _, t, _ in good), sum(c for _, _, c in good) / len(good)
 
     def ocr_read(frame):
         if frame is None:
             return "No camera image."
-        if _ocr["reader"] is None:
+        # quality gate: refuse junk frames, guide the user (don't read garbage)
+        a = fq.assess(frame)
+        if not a.get("ok") and a.get("reason") in ("too_dark", "too_blurry", "no_frame"):
+            return "Hold steady in better light and try again."
+        reader = shared.get("ocr_reader")
+        if reader is None:                       # warm-up not finished -> load now
             import easyocr
             speaker.speak("Loading reader")
-            _ocr["reader"] = easyocr.Reader(["ne", "en"], gpu=False)   # Pi = CPU
-        g = fq.read_preprocess(frame)
-        lines = _ocr["reader"].readtext(g, detail=0)
-        return " ".join(lines).strip() or "No readable text found."
+            reader = easyocr.Reader(["ne", "en"], gpu=False)   # Pi = CPU
+            shared["ocr_reader"], shared["ocr_ready"] = reader, True
+        base = fq.read_preprocess(frame)
+        text, conf = _ocr_pass(reader, base)
+        if not text or conf < 0.50:              # rotate-retry: signs/notes held sideways
+            for k in (1, 2, 3):
+                t, c = _ocr_pass(reader, fq.rotate90(base, k))
+                if t and (c > conf or not text):
+                    text, conf = t, c
+        return text or "No readable text found."
 
     def sample_frames(n=10, gap=0.1):
         """Grab ~n recent frames over ~1s for banknote temporal voting."""
@@ -285,7 +375,11 @@ def _build_dispatch(speaker, banknote, crossing_mon, mtally, shared, fq, remote)
         if a == "none":
             speaker.speak("Yes?"); return
         if a == "stop":
-            shared["find"] = None; return
+            shared["find"] = None
+            if finder_obj is not None and finder_obj.active:
+                finder_obj.exit(); shared["beacon"].off(); shared["pick"] = []
+                say("Find mode off, back to navigate")
+            return
         if a in ("louder", "softer", "faster", "slower"):
             speaker.adjust(a); return
         if a == "navigate":
@@ -299,6 +393,19 @@ def _build_dispatch(speaker, banknote, crossing_mon, mtally, shared, fq, remote)
             say(r); return
         if a == "cross":     # ALWAYS local (safety, uses the local Navigate detections)
             say(crossing_mon.query(dets, frame)["text"] if frame is not None else "No view yet."); return
+        if a == "how_far":   # nearest object distance + clear path ahead (local)
+            est = getattr(vision, "distance", None) if vision is not None else None
+            say(how_far_phrase(dets, est, "en")[0]); return
+        if a == "scan":      # list what's around with positions + distances (local)
+            say(scan_area_phrase(dets, "en")[0]); return
+        if a in ("mode_street", "mode_public", "mode_home"):
+            name = a.split("_", 1)[1]
+            if set_sub_mode(name):
+                shared["sub_mode"] = name
+                say(f"{name.capitalize()} mode")
+            else:
+                say("Unknown mode")
+            return
         if a == "read" or a == "label":
             rr = remote.ocr(frame, label=(a == "label")) if frame is not None else None
             if rr is not None:
@@ -335,8 +442,27 @@ def _build_dispatch(speaker, banknote, crossing_mon, mtally, shared, fq, remote)
             try: say(mtally.change_for(int(tgt or 0))["text"])
             except (TypeError, ValueError): say("Tell me an amount.")
             return
-        if a == "find":
-            shared["find"] = (tgt or "").lower(); say("Looking for " + (tgt or "")); return
+        # --- Object Finder mode ------------------------------------------------
+        if a == "find_mode":
+            if finder_obj is None: say("Find mode is unavailable."); return
+            say(finder_obj.start_scan(time.time())); return
+        if a == "find":      # "find a cup" -> immediate lock; else fall into a scan
+            if finder_obj is None: say("Find mode is unavailable."); return
+            conf = finder_obj.find_class(tgt or "", dets, time.time())
+            if conf: say(conf)
+            else: say(f"I don't see a {tgt} right now. " + finder_obj.start_scan(time.time()))
+            return
+        if a == "track":
+            if finder_obj is None: return
+            conf = finder_obj.choose(tgt or "")
+            say(conf or "I didn't catch which one. Say the letter or the name."); return
+        if a == "room_scan":
+            if finder_obj is None: say("Unavailable."); return
+            say(finder_obj.room_scan(dets)); return
+        if a == "found":
+            if finder_obj is not None and finder_obj.active:
+                finder_obj.exit(); shared["beacon"].off(); shared["pick"] = []
+            say("Great, back to navigate"); return
         if a == "repeat":
             speaker.speak(shared["last"] or "Nothing to repeat yet."); return
         if a == "sos":
@@ -354,6 +480,27 @@ def _build_dispatch(speaker, banknote, crossing_mon, mtally, shared, fq, remote)
             say("Enrolling a face needs the laptop. Use it nearby and online."); return
 
     return on_command
+
+
+def _start_dashboard(web, port):
+    """Start the live dashboard. Prefer the full FastAPI/WebSocket pi_server; if
+    fastapi/uvicorn aren't installed, fall back to the stdlib pi_web preview. Returns
+    an object with a uniform .update(frame, detections, announce, **fields) method, or
+    None if web is disabled / unavailable."""
+    if not web:
+        return None
+    try:
+        import pi_server
+        return pi_server.start(pi_server.DashboardState(), port=port)
+    except Exception as exc:
+        log.warning("Full dashboard (pi_server) unavailable (%s) -- using stdlib preview. "
+                    "Install fastapi+uvicorn for the WebSocket dashboard.", exc)
+        try:
+            from pi_web import WebPreview
+            return WebPreview(port=port).start()
+        except Exception as exc2:
+            log.warning("Web preview also failed (%s) -- running headless.", exc2)
+            return None
 
 
 def run(server_url=None, camera_index=None, show=False, web=False, web_port=8080, no_enhance=False):
@@ -386,12 +533,34 @@ def run(server_url=None, camera_index=None, show=False, web=False, web_port=8080
         log.info("No COMPUTE_SERVER_URL -- running fully on-device (offload disabled).")
 
     # voice command components (shared state updated each frame by the loop)
+    import finder as finder_mod
     banknote = BanknoteClassifier()
     crossing_mon = CrossingMonitor()
     mtally = MoneyTally()
-    shared = {"frame": None, "dets": [], "find": None, "last": ""}
+    finder_obj = finder_mod.ObjectFinder(profile="pi")
+    beacon = Beacon()
+    shared = {"frame": None, "dets": [], "find": None, "last": "",
+              "sub_mode": vc.get_sub_mode(), "light": None,
+              "finder": finder_obj, "beacon": beacon, "pick": [],
+              "ocr_reader": None, "ocr_ready": False}
+
+    # Pre-warm EasyOCR on a background thread so the first Read is fast (no 30 s
+    # download mid-demo). Offload still prefers the laptop; this is the local fallback.
+    if PREWARM_OCR:
+        def _warm_ocr():
+            try:
+                import easyocr
+                log.info("Pre-warming EasyOCR on the Pi (one-time, ~20 s, background)...")
+                shared["ocr_reader"] = easyocr.Reader(["ne", "en"], gpu=False)
+                shared["ocr_ready"] = True
+                log.info("Pi OCR pre-warmed and READY.")
+            except Exception as exc:
+                log.warning("Pi OCR pre-warm failed (%s) -- will load on first Read.", exc)
+        import threading
+        threading.Thread(target=_warm_ocr, daemon=True).start()
+
     if VOICE_ENABLED:
-        start_voice(_build_dispatch(speaker, banknote, crossing_mon, mtally, shared, fq, remote),
+        start_voice(_build_dispatch(speaker, banknote, crossing_mon, mtally, shared, fq, remote, vision, vc),
                     on_partial=speaker.stop)   # on_partial -> barge-in
     else:
         log.info("Pi voice control DISABLED (VOICE_ENABLED=False). "
@@ -404,14 +573,12 @@ def run(server_url=None, camera_index=None, show=False, web=False, web_port=8080
         return
     log.info("SoundSight Pi running on camera %d (%s). Ctrl+C to stop.", cam_index, backend)
 
-    preview = None
-    if web:
-        from pi_web import WebPreview
-        preview = WebPreview(port=web_port, title="SoundSight Pi (on-device)").start()
+    preview = _start_dashboard(web, web_port)
 
     fails = 0                 # consecutive failed reads
     low_power = False         # perf guard active?
     win_t0, win_frames = time.time(), 0
+    cur_fps = 0.0
     prev_frame = None
 
     try:
@@ -461,24 +628,51 @@ def run(server_url=None, camera_index=None, show=False, web=False, web_port=8080
                         f"{d['label']}({_closeness(d)})" for d in detections) or "(nothing)")
                 approaching = approach.approaching_objects(detections)
                 announced = None
+                finding = finder_obj.active   # Find mode suppresses AMBIENT navigate
                 for item in select_announcements(detections, manager, approaching, now):
+                    # In Find mode only HAZARDS (very close) still interrupt.
+                    if finding and item.get("urgency") != "very close":
+                        continue
                     speak(item["text"])
                     announced = item["text"]
-                if preview is not None:   # live demo view of the Pi's own camera
-                    preview.update(frame, detections, announced)
 
-                # --- active object FIND guidance (set by a voice command) ----- #
-                if shared["find"]:
-                    tgt = shared["find"]
-                    hits = [d for d in detections if tgt in d["label"].lower() or d["label"].lower() in tgt]
-                    if hits:
-                        d = max(hits, key=lambda d: d.get("area_ratio", 0))
-                        from vision_core import zone_for
-                        z = zone_for(d["cx"])
-                        if d.get("area_ratio", 0) > 0.20 and z == "ahead":
-                            speak(f"{tgt} right in front. Found it."); shared["find"] = None
-                        else:
-                            speak(f"{tgt} {z}")
+                # --- STREET sub-mode: auto traffic-light state (confirmed changes) -
+                if vc.get_sub_mode() == "street":
+                    light = crossing_mon.update(detections, frame, now)
+                    if light:
+                        speaker.stop()            # safety message takes priority
+                        speak(light["text"])
+                        announced = light["text"]
+                    shared["light"] = crossing_mon.confirmed
+
+                # --- Object Finder: scan -> pick-list -> guide + beacon -------- #
+                if finder_obj.state == "scanning":
+                    res = finder_obj.update_scan(detections, now)
+                    if res:                       # scan window ended -> speak the list
+                        speak(res[1]); shared["pick"] = res[2]
+                        shared["last"] = res[1]
+                elif finder_obj.state == "tracking":
+                    g = finder_obj.guide(detections, now)
+                    beacon.update(g["beacon"])
+                    if g["text"] and not announced:   # hazard this frame wins the voice
+                        speak(g["text"]); shared["last"] = g["text"]
+                    if g["done"]:
+                        beacon.off(); beacon.success(); shared["pick"] = []
+                else:
+                    beacon.off()
+
+                if preview is not None:   # live dashboard of the Pi's own camera
+                    preview.update(frame, detections, announced,
+                                   sub_mode=vc.get_sub_mode(), light=shared.get("light"),
+                                   mode=("FIND" if finding else "NAVIGATE"),
+                                   pick=shared.get("pick"),
+                                   target=(finder_obj.target or {}).get("label") if finding else None,
+                                   traffic_light=shared.get("light"),
+                                   find_target=(finder_obj.target or {}).get("label") if finding else None,
+                                   fps=cur_fps,
+                                   laptop_link=remote.link_status,
+                                   laptop_ms=remote.last_latency_ms,
+                                   ocr_ready=shared.get("ocr_ready", False))
 
             except Exception as exc:   # one bad frame must never kill the loop
                 log.exception("Loop error (continuing): %s", exc)
@@ -489,6 +683,7 @@ def run(server_url=None, camera_index=None, show=False, web=False, web_port=8080
             win_frames += 1
             if win_frames >= PERF_WINDOW:
                 fps = win_frames / (time.time() - win_t0)
+                cur_fps = fps
                 temp = soc_temp_c()
                 hot = temp is not None and temp >= TEMP_HIGH_C
                 if (fps < FPS_FLOOR or hot) and not low_power:
@@ -599,10 +794,7 @@ def run_remote_only(server_url=None, camera_index=None, show=False, web=False, w
         return 2
     log.info("SoundSight Pi remote-only running on camera %d (%s). Ctrl+C to stop.", cam_index, backend)
 
-    preview = None
-    if web:
-        from pi_web import WebPreview
-        preview = WebPreview(port=web_port, title="SoundSight Pi (server detection)").start()
+    preview = _start_dashboard(web, web_port)
 
     manager = RemoteAnnouncementManager()
     offline_spoken = False
@@ -625,7 +817,8 @@ def run_remote_only(server_url=None, camera_index=None, show=False, web=False, w
                     speaker.speak("Laptop is offline")
                     offline_spoken = True
                 if preview is not None:
-                    preview.update(frame, [], "Laptop is offline")
+                    preview.update(frame, [], "Laptop is offline", mode="NAVIGATE",
+                                   laptop_link=remote.link_status, laptop_ms=remote.last_latency_ms)
                 time.sleep(1.0)
                 continue
             offline_spoken = False
@@ -638,7 +831,9 @@ def run_remote_only(server_url=None, camera_index=None, show=False, web=False, w
                 log.info("SEE: %s", ", ".join(
                     f"{d.get('label')}({_closeness(d)})" for d in detections) or "(nothing)")
             if preview is not None:
-                preview.update(frame, detections, msg)
+                preview.update(frame, detections, msg, mode="NAVIGATE",
+                               laptop_link=remote.link_status, laptop_ms=remote.last_latency_ms,
+                               fps=(1.0 / max(1e-3, time.time() - t0)))
 
             dt = time.time() - t0
             if dt < FRAME_INTERVAL:
@@ -1179,10 +1374,11 @@ def main():
     ap.add_argument("--show", action="store_true",
                     help="print detections to the terminal each frame so you can SEE what it detects")
     ap.add_argument("--web", action="store_true",
-                    help="serve a live preview of the PI's camera + detections at http://<pi-ip>:PORT "
-                         "(great for demos -- open it on a phone/laptop on the same LAN)")
+                    help="(default ON) serve the live dashboard at http://<pi-ip>:PORT")
+    ap.add_argument("--no-web", action="store_true",
+                    help="headless: do NOT start the web dashboard (Pi without a display)")
     ap.add_argument("--web-port", type=int, default=8080,
-                    help="port for the --web live preview (default 8080)")
+                    help="port for the live dashboard (default 8080)")
     args = ap.parse_args()
     if args.no_track:
         os.environ["SOUNDSIGHT_NO_TRACK"] = "1"   # read by VisionCore before the model loads
@@ -1215,7 +1411,7 @@ def main():
         # --remote-only: everything on the laptop (Torch-free Pi). Explicit opt-in.
         if args.remote_only:
             raise SystemExit(run_remote_only(server_url, args.camera_index,
-                                             show=args.show, web=args.web, web_port=args.web_port))
+                                             show=args.show, web=(not args.no_web), web_port=args.web_port))
 
         # Otherwise we want the HYBRID: the Pi runs the light Navigate model locally and
         # offloads only the heavy on-demand features (Read/Money/Describe/Faces) to the
@@ -1232,7 +1428,7 @@ def main():
             if server_url:
                 log.warning("Torch is unavailable -> falling back to REMOTE-ONLY (all detection on the laptop).")
                 raise SystemExit(run_remote_only(server_url, args.camera_index,
-                                                 show=args.show, web=args.web, web_port=args.web_port))
+                                                 show=args.show, web=(not args.no_web), web_port=args.web_port))
             log.error("No compute server either. Start one and use --find-server:")
             log.error("  laptop:  python server.py --lan")
             log.error("  Pi:      python pi_app.py --find-server")
@@ -1240,7 +1436,7 @@ def main():
 
         if server_url:
             log.info("HYBRID mode: Pi runs Navigate locally, offloads heavy features to %s", server_url)
-        run(server_url, args.camera_index, show=args.show, web=args.web, web_port=args.web_port,
+        run(server_url, args.camera_index, show=args.show, web=(not args.no_web), web_port=args.web_port,
             no_enhance=args.no_enhance)
 
 

@@ -44,23 +44,38 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
   .u { color:#ff6b6b; font-weight:600; } .n { color:#ffd166; } .f { color:#8aa0b5; }
   .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#3fb950; margin-right:6px; }
 </style></head><body>
-<header><span class="dot"></span><b>__TITLE__</b><span>live on-device preview</span></header>
+<header><span class="dot"></span><b>__TITLE__</b><span>live on-device preview</span>
+  <span style="margin-left:auto" id="mode">STREET</span>
+  <span id="light"></span></header>
 <div class="wrap">
   <div class="video"><img src="/stream" alt="Pi camera stream"></div>
   <div class="panel">
     <h3>Now saying</h3><div class="say" id="say">…</div>
-    <h3 style="margin-top:14px">Detections</h3><ul id="dets"></ul>
+    <h3 style="margin-top:14px" id="listHdr" style="display:none">Find: pick a letter</h3>
+    <ul id="pick"></ul>
+    <h3 style="margin-top:14px">Detections (distance)</h3><ul id="dets"></ul>
   </div>
 </div>
 <script>
+function dist(m){ if(m==null) return '';
+  if(m<0.5) return 'very close'; if(m<2) return '~'+(Math.round(m*4)/4)+' m'; return '~'+(Math.round(m*2)/2)+' m'; }
+const LIGHT={red:['#ff5252','RED'],amber:['#ffb300','AMBER'],green:['#3fb950','GREEN']};
 async function tick(){
   try{
     const s = await (await fetch('/status')).json();
     document.getElementById('say').textContent = s.announce || '—';
+    const mode = (s.mode||'NAVIGATE');
+    document.getElementById('mode').textContent = mode + (mode==='NAVIGATE' ? ' · '+(s.sub_mode||'street').toUpperCase() : '');
+    const pick = s.pick||[]; const ph=document.getElementById('listHdr'); const pu=document.getElementById('pick');
+    if(pick.length){ ph.style.display='block'; pu.innerHTML = pick.map(p=>`<li><span><b>${p.letter}</b> ${p.label} ${p.zone}</span><span class="f">${dist(p.dist)}</span></li>`).join(''); }
+    else { ph.style.display='none'; pu.innerHTML=''; }
+    const le = document.getElementById('light');
+    if(s.light && LIGHT[s.light]){ le.textContent='● '+LIGHT[s.light][1]; le.style.color=LIGHT[s.light][0]; }
+    else { le.textContent=''; }
     const ul = document.getElementById('dets');
     ul.innerHTML = (s.dets||[]).map(d=>{
       const cls = d.urgency==='very close'?'u':(d.close==='near'?'n':'f');
-      const tag = d.urgency || d.close || '';
+      const tag = dist(d.dist) || d.urgency || d.close || '';
       return `<li><span>${d.label}</span><span class="${cls}">${tag}</span></li>`;
     }).join('') || '<li><span class="f">nothing in view</span></li>';
   }catch(e){}
@@ -80,8 +95,9 @@ def _closeness(det):
     return "far"
 
 
-def _annotate(frame, detections):
-    """Draw boxes + labels on a copy of the frame. Red = very close, amber = near."""
+def _annotate(frame, detections, target=None):
+    """Draw boxes + labels on a copy of the frame. Red = very close, amber = near.
+    The Find-mode locked target (by label) is boxed in cyan to stand out."""
     import cv2
 
     img = frame.copy()
@@ -91,7 +107,10 @@ def _annotate(frame, detections):
             continue
         x1, y1, x2, y2 = (int(v) for v in box[:4])
         close = _closeness(d)
-        color = (60, 60, 255) if close == "very close" else (40, 200, 230) if close == "near" else (80, 200, 80)
+        if target and d.get("label") == target:
+            color = (255, 220, 0)   # cyan-ish = the object you're being guided to
+        else:
+            color = (60, 60, 255) if close == "very close" else (40, 200, 230) if close == "near" else (80, 200, 80)
         label = str(d.get("label") or "object")
         conf = d.get("confidence")
         txt = f"{label} {conf:.2f}" if isinstance(conf, (int, float)) else label
@@ -116,21 +135,32 @@ class WebPreview:
         self._status = {"announce": "", "dets": []}
         self._httpd = None
 
-    def update(self, frame, detections=None, announce=None):
+    def update(self, frame, detections=None, announce=None, sub_mode=None, light=None,
+               mode=None, pick=None, target=None, **_ignored):   # stdlib fallback ignores extra dashboard fields
         try:
             import cv2
 
-            img = _annotate(frame, detections)
+            img = _annotate(frame, detections, target)
             ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, self.quality])
             if not ok:
                 return
             dets = [{"label": d.get("label"), "urgency": d.get("urgency"),
-                     "close": _closeness(d)} for d in (detections or [])]
+                     "close": _closeness(d),
+                     "dist": d.get("distance_m")} for d in (detections or [])]
             with self._lock:
                 self._jpeg = buf.tobytes()
                 self._status["dets"] = dets
                 if announce:
                     self._status["announce"] = announce
+                if sub_mode is not None:
+                    self._status["sub_mode"] = sub_mode
+                self._status["light"] = light
+                if mode is not None:
+                    self._status["mode"] = mode
+                self._status["pick"] = [{"letter": p["letter"], "label": p["label"],
+                                         "zone": p["zone"], "dist": p["distance_m"]}
+                                        for p in (pick or [])]
+                self._status["target"] = target
         except Exception as exc:   # a preview hiccup must never kill the loop
             log.debug("web preview update skipped: %s", exc)
 

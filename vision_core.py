@@ -34,6 +34,7 @@ import cv2
 import torch
 from ultralytics import YOLO
 
+import distance as _dist
 import frame_quality as fq
 
 log = logging.getLogger("soundsight.vision")
@@ -168,6 +169,67 @@ IMPORTANCE = {
     "traffic light": 2, "stop sign": 2,
 }
 
+# --------------------------------------------------------------------------- #
+# NAVIGATE SUB-MODES  --  context changes what to prioritise/announce.
+# --------------------------------------------------------------------------- #
+# STREET (default): outdoors/road -- people, vehicles, traffic lights, crossings,
+#                   poles, kerbs. Traffic-light state is announced automatically.
+# PUBLIC: indoor public space -- doors, stairs, benches, signs, crowds (count people).
+# HOME:   indoors -- furniture, appliances, objects; vehicles de-prioritised; room
+#         context (fridge/sink -> kitchen, bed -> bedroom) tunes phrasing.
+SUB_MODES = ("street", "public", "home")
+_sub_mode = "street"          # module-global current sub-mode (set via set_sub_mode)
+
+# Per-sub-mode importance BOOSTS layered on top of IMPORTANCE (additive). A class
+# not listed keeps its base importance. Negative = de-prioritise.
+SUB_MODE_BOOST = {
+    "street": {"person": 2, "car": 3, "bus": 3, "truck": 3, "motorcycle": 3,
+               "bicycle": 2, "traffic light": 3, "stop sign": 2, "pole": 2,
+               "curb": 2, "pothole": 2},
+    "public": {"door": 3, "stairs": 3, "bench": 2, "stop sign": 2, "person": 1,
+               "car": -2, "truck": -2, "bus": -2, "motorcycle": -2},
+    "home":   {"chair": 2, "couch": 2, "bed": 2, "table": 2, "tv": 2,
+               "refrigerator": 2, "sink": 2, "oven": 2, "microwave": 2, "toilet": 2,
+               "potted plant": 1, "plant": 1, "car": -3, "truck": -3, "bus": -3,
+               "motorcycle": -3, "traffic light": -2},
+}
+
+# Room inference: presence of these classes implies a room, used to colour HOME phrasing.
+ROOM_HINTS = {
+    "kitchen": {"refrigerator", "sink", "oven", "microwave", "toaster"},
+    "bedroom": {"bed"},
+    "bathroom": {"toilet", "sink"},
+    "living room": {"couch", "tv"},
+    "dining area": {"dining table", "table"},
+}
+
+
+def set_sub_mode(mode):
+    """Switch the active Navigate sub-mode. Returns the canonical mode name or None
+    if unrecognised (caller can speak an error)."""
+    global _sub_mode
+    m = (mode or "").strip().lower()
+    if m in SUB_MODES:
+        _sub_mode = m
+        log.info("Navigate sub-mode -> %s", m)
+        return m
+    return None
+
+
+def get_sub_mode():
+    return _sub_mode
+
+
+def infer_room(detections):
+    """Best-guess room name from the detected classes (HOME mode phrasing), or None."""
+    labels = {d.get("label") for d in (detections or [])}
+    best, best_n = None, 0
+    for room, hints in ROOM_HINTS.items():
+        n = len(labels & hints)
+        if n > best_n:
+            best, best_n = room, n
+    return best
+
 
 # --------------------------------------------------------------------------- #
 # Proximity / urgency
@@ -235,7 +297,10 @@ def conf_threshold(canonical):
 
 
 def importance_of(canonical):
-    return IMPORTANCE.get(canonical, DEFAULT_IMPORTANCE)
+    """Announce-priority for a class, adjusted by the active Navigate sub-mode."""
+    base = IMPORTANCE.get(canonical, DEFAULT_IMPORTANCE)
+    boost = SUB_MODE_BOOST.get(_sub_mode, {}).get(canonical, 0)
+    return base + boost
 
 
 # --------------------------------------------------------------------------- #
@@ -338,9 +403,8 @@ def _phrase(name, zone, urgency, count, approaching=False, distance=None):
     Returns (text, rate, urgent) -- same fields select_announcements always had."""
     dsuf = ""
     if distance is not None:   # distance.py is wired in by the caller when available
-        import distance as _dist
         sp = _dist.spoken_distance(distance)
-        dsuf = (", " + sp) if (sp and sp != "right in front") else ""
+        dsuf = (", " + sp) if (sp and sp not in ("right in front", "very close")) else ""
     # A very-close warning is about the single nearest hazard, not the count.
     # (Comma rather than an em-dash: safe for espeak-ng + Windows console logs.)
     if urgency == URGENCY_VERY_CLOSE:
@@ -382,31 +446,36 @@ NE_ZONES = {"ahead": "अगाडि", "on your left": "बायाँति�
 NE_NUMS = {2: "दुई", 3: "तीन", 4: "चार", 5: "पाँच", 6: "छ", 7: "सात", 8: "आठ", 9: "नौ"}
 
 
-def _phrase_ne(name, zone, urgency, count, approaching=False):
+def _phrase_ne(name, zone, urgency, count, approaching=False, distance=None):
     """Nepali (Devanagari) wording mirroring _phrase(); returns just the string."""
     nm = NE_NAMES.get(name, name)
     z = NE_ZONES.get(zone, zone)
+    dsuf = ""
+    if distance is not None:
+        sp = _dist.spoken_distance_ne(distance)
+        dsuf = (", " + sp) if (sp and sp not in ("ठीक अगाडि", "धेरै नजिक")) else ""
     if urgency == URGENCY_VERY_CLOSE:
         if zone == "ahead":
             return f"सावधान, {nm} ठीक अगाडि"
         return f"सावधान, {nm} {z}"
     head = nm if count == 1 else f"{NE_NUMS.get(count, count)} {nm}"
     if approaching:
-        return f"{head} {z}, नजिक आउँदै"
-    if urgency == URGENCY_NEAR:
+        return f"{head} {z}{dsuf}, नजिक आउँदै"
+    if not dsuf and urgency == URGENCY_NEAR:
         return f"{head} {z}, नजिक"
-    return f"{head} {z}"
+    return f"{head} {z}{dsuf}"
 
 
 class _TrackState:
     """Debounced per-object memory (one per stable track_id)."""
     __slots__ = ("label", "zone", "urgency", "area", "uarea", "path",
-                 "approaching", "last_seen")
+                 "approaching", "last_seen", "distance")
 
-    def __init__(self, label, zone, urgency, area, uarea, path, last_seen):
+    def __init__(self, label, zone, urgency, area, uarea, path, last_seen, distance=None):
         self.label, self.zone, self.urgency = label, zone, urgency
         self.area, self.uarea, self.path = area, uarea, path
         self.approaching, self.last_seen = False, last_seen
+        self.distance = distance
 
 
 class _GroupState:
@@ -501,14 +570,19 @@ class AnnouncementManager:
             uar = det.get("urgency_area", ar)        # class-aware area for urgency
             path = det.get("path_score", 0)          # 0..2: in the walking path?
             appr = (det["label"], raw_zone) in approaching
+            dm = det.get("distance_m")               # metric distance when known
+            dist_urg = _dist.distance_tier(dm)       # distance-driven urgency, or None
             t = self.tracks.get(key)
             if t is None:
-                t = _TrackState(det["label"], raw_zone, classify_urgency(uar), ar, uar, path, f)
+                urg = dist_urg if dist_urg is not None else classify_urgency(uar)
+                t = _TrackState(det["label"], raw_zone, urg, ar, uar, path, f, dm)
                 self.tracks[key] = t
             else:
                 t.zone = self._debounce_zone(t.zone, det["cx"])
-                t.urgency = self._debounce_urgency(t.urgency, uar)
-                t.label, t.area, t.uarea, t.path = det["label"], ar, uar, path
+                # Distance, when known, drives urgency directly (it's already EMA-
+                # smoothed in distance.py); else fall back to area hysteresis.
+                t.urgency = dist_urg if dist_urg is not None else self._debounce_urgency(t.urgency, uar)
+                t.label, t.area, t.uarea, t.path, t.distance = det["label"], ar, uar, path, dm
             t.approaching, t.last_seen = appr, f
 
         # 2) forget stale tracks (+ hard cap so a long session can't grow unbounded)
@@ -518,15 +592,21 @@ class AnnouncementManager:
             for k in sorted(self.tracks, key=lambda k: self.tracks[k].last_seen)[:-MAX_TRACKS]:
                 del self.tracks[k]
 
-        # 3) group ALIVE tracks by (label, debounced zone); nearest member drives urgency
+        # 3) group ALIVE tracks by (label, debounced zone); the NEAREST member drives
+        #    urgency + the spoken distance (by metric distance when known, else area).
         groups = {}
         for tkey, t in self.tracks.items():
             g = groups.setdefault((t.label, t.zone),
                                   {"ids": set(), "area": -1.0, "urgency": URGENCY_FAR,
-                                   "approaching": False, "path": 0})
+                                   "approaching": False, "path": 0, "distance": None})
             g["ids"].add(tkey)
-            if t.area > g["area"]:
-                g["area"], g["urgency"] = t.area, t.urgency
+            # nearest by distance if available, else nearest by apparent area
+            if t.distance is not None:
+                if g["distance"] is None or t.distance < g["distance"]:
+                    g["distance"], g["urgency"] = t.distance, t.urgency
+            elif g["distance"] is None and t.area > g["area"]:
+                g["urgency"] = t.urgency
+            g["area"] = max(g["area"], t.area)
             if t.approaching:
                 g["approaching"] = True
             g["path"] = max(g["path"], t.path)
@@ -580,9 +660,11 @@ class AnnouncementManager:
         for _rank, event, gk, g in candidates[:MAX_PER_CYCLE]:
             label, zone = gk
             text, rate, urgent = _phrase(label, zone, g["urgency"], len(g["ids"]),
-                                         approaching=(event == "approaching"))
+                                         approaching=(event == "approaching"),
+                                         distance=g.get("distance"))
             text_ne = _phrase_ne(label, zone, g["urgency"], len(g["ids"]),
-                                 approaching=(event == "approaching"))
+                                 approaching=(event == "approaching"),
+                                 distance=g.get("distance"))
             spoken.append({"text": text, "text_ne": text_ne, "rate": rate,
                            "urgent": urgent, "urgency": g["urgency"]})
             reasons.append(event)
@@ -599,8 +681,10 @@ class AnnouncementManager:
                 URGENCY_RANK[kv[1]["urgency"]], PATH_WEIGHT * kv[1]["path"],
                 importance_of(kv[0][0]), kv[1]["area"]))
             label, zone = gk
-            text, rate, urgent = _phrase(label, zone, g["urgency"], len(g["ids"]))
-            text_ne = _phrase_ne(label, zone, g["urgency"], len(g["ids"]))
+            text, rate, urgent = _phrase(label, zone, g["urgency"], len(g["ids"]),
+                                         distance=g.get("distance"))
+            text_ne = _phrase_ne(label, zone, g["urgency"], len(g["ids"]),
+                                 distance=g.get("distance"))
             spoken.append({"text": text, "text_ne": text_ne, "rate": rate,
                            "urgent": urgent, "urgency": g["urgency"]})
             reasons.append("refresh")
@@ -683,11 +767,18 @@ class VisionCore:
     def __init__(self, mode=MODEL_MODE, accuracy=MODEL_ACCURACY):
         self.mode = mode
         self.accuracy = accuracy
-        # AUTO LIGHT PATH on the Pi/ARM (no CUDA): force NCNN nano + imgsz 320 so a
-        # fresh Pi "just works" even via server.py, and we never try device=cuda.
-        if IS_ARM and DEVICE == "cpu" and self.mode == "coco":
-            log.info("ARM + no CUDA detected -> light path: coco-ncnn, fast (imgsz 320).")
-            self.mode, self.accuracy = "coco-ncnn", "fast"
+        # AUTO LIGHT PATH whenever there's NO CUDA (Pi OR a laptop without a working
+        # GPU). yolo11s/m @640 on a CPU is ~3-4 FPS; yolo11n @320 is several times
+        # faster and keeps the app usable. NCNN on ARM (fastest there); plain nano .pt
+        # elsewhere. (A real GPU keeps the heavy yolo11m@640 path -- see below.)
+        if DEVICE == "cpu" and self.mode == "coco":
+            self.accuracy = "fast"                       # -> yolo11n @ imgsz 320
+            if IS_ARM:
+                self.mode = "coco-ncnn"
+                log.info("ARM + no CUDA -> light path: coco-ncnn nano @320.")
+            else:
+                log.warning("No CUDA detected -> CPU light path: yolo11n @320 (usable FPS). "
+                            "Set up the GPU (see startup GPU note) for yolo11m @640.")
         # Pi/NCNN must never run the heavy "accurate" (yolo11m + TTA) tier.
         if self.mode == "coco-ncnn" and self.accuracy == "accurate":
             log.warning("Pi/NCNN can't run 'accurate' (yolo11m + TTA) -- using 'fast'.")
@@ -718,6 +809,15 @@ class VisionCore:
         self.enhance_frames = ENHANCE_FRAMES
         self._last_assess = None
         self._last_enhanced = False
+        # Distance: geometric (+ close-range clip cap) on every device -- fast. The
+        # Depth Anything V2 model is OFF by default: in the live Navigate loop it cost
+        # ~0.7 s/frame and pegged the CPU (dropping FPS to ~2.5). Geometric + clip-cap
+        # is plenty for navigation. Re-enable depth fusion with SOUNDSIGHT_DEPTH=1.
+        from distance import DistanceEstimator
+        use_depth = os.environ.get("SOUNDSIGHT_DEPTH", "0") not in ("0", "false", "False")
+        self.distance = DistanceEstimator(profile=FEATURE_PROFILE, use_depth=use_depth)
+        if use_depth and FEATURE_PROFILE == "laptop":
+            log.info("Depth fusion ENABLED (SOUNDSIGHT_DEPTH=1) -- slower; geometric is default.")
         log.info("Detection: profile=%s, mode=%s, model=%s, imgsz=%d, half=%s, augment=%s, "
                  "device=%s, DETECT_ALL=%s", FEATURE_PROFILE, self.mode, self._stem, self.imgsz,
                  self.half, self.augment, DEVICE.upper(), DETECT_ALL)
@@ -870,9 +970,27 @@ class VisionCore:
         if len(survivors) - len(confirmed):
             dropped["unconfirmed"] = len(survivors) - len(confirmed)
 
-        # --- Stage 4: rank (closeness, then path, then priority class, then size) -
+        # --- Stage 4a: DISTANCE -- metric distance on every object (geom + depth
+        # fusion on laptop, geom only on Pi). Sets det['distance_m']/'dist_source'.
+        try:
+            self.distance.annotate(confirmed, frame_bgr)
+        except Exception as exc:   # distance must never crash the Navigate loop
+            log.warning("distance annotate failed (%s) -- continuing without metric distance", exc)
+        # Metric distance, when known, OVERRIDES area-based urgency (very close <1 m,
+        # near 1-3 m, far >3 m) so a small-but-near object is still flagged.
+        for d in confirmed:
+            tier = _dist.distance_tier(d.get("distance_m"))
+            if tier is not None:
+                d["urgency"] = tier
+
+        # --- Stage 4b: rank -- CLOSER FIRST (metric distance when known), then
+        # path, urgency, sub-mode priority, size. Unknown-distance sorts after known.
+        def _dist_key(d):
+            dm = d.get("distance_m")
+            return -dm if dm is not None else -1e6   # nearer (smaller m) ranks higher
         confirmed.sort(
             key=lambda d: (
+                _dist_key(d),
                 URGENCY_RANK[d["urgency"]],
                 PATH_WEIGHT * d.get("path_score", 0),  # things in the walking line first
                 importance_of(d["label"]),
@@ -919,6 +1037,64 @@ def select_announcements(detections, manager, approaching, now):
     so the browser / Pi speech code doesn't change.
     """
     return manager.process(detections, approaching, now)
+
+
+# --------------------------------------------------------------------------- #
+# On-demand distance answers  ("how far" / "scan area")
+# --------------------------------------------------------------------------- #
+def how_far_phrase(detections, dist_estimator=None, lang="en"):
+    """Answer the 'how far' command: the nearest object's distance plus the clear
+    free-space ahead (depth/laptop only -- silently omitted on the Pi). Returns
+    (text_en, text_ne). Never raises; always returns something to say."""
+    en, ne = [], []
+    near = _dist.nearest_with_distance(detections)
+    if near is not None:
+        zone = zone_for(near["cx"])
+        en.append(f"Nearest, {near['label']} {zone}, {_dist.spoken_distance(near['distance_m'])}.")
+        ne.append(f"सबैभन्दा नजिक, {NE_NAMES.get(near['label'], near['label'])} "
+                  f"{NE_ZONES.get(zone, zone)}, {_dist.spoken_distance_ne(near['distance_m'])}।")
+    fs = None
+    try:
+        fs = dist_estimator.free_space_phrase() if dist_estimator is not None else None
+    except Exception:
+        fs = None
+    if fs is not None:
+        fen, fne, _obstacle = fs
+        en.append(fen)
+        ne.append(fne)
+    if not en:
+        return ("I can't tell distances right now.", "अहिले दूरी भन्न सकिनँ।")
+    return (" ".join(en), " ".join(ne))
+
+
+def scan_area_phrase(detections, lang="en"):
+    """PUBLIC-mode 'scan area': list what's around with rough position + distance.
+    Returns (text_en, text_ne)."""
+    if not detections:
+        return ("Nothing notable around you.", "वरिपरि केही उल्लेखनीय छैन।")
+    groups = {}
+    for d in detections:
+        z = zone_for(d["cx"])
+        g = groups.setdefault((d["label"], z), {"n": 0, "dist": None})
+        g["n"] += 1
+        dm = d.get("distance_m")
+        if dm is not None and (g["dist"] is None or dm < g["dist"]):
+            g["dist"] = dm
+    items = sorted(groups.items(),
+                   key=lambda kv: (importance_of(kv[0][0]), -(kv[1]["dist"] or 1e6)),
+                   reverse=True)
+    en, ne = [], []
+    for (label, zone), g in items[:6]:
+        sp = _dist.spoken_distance(g["dist"])
+        dsuf = f", {sp}" if sp and sp not in ("right in front", "very close") else ""
+        head = label if g["n"] == 1 else f"{_number_word(g['n'])} {_pluralize(label, g['n'])}"
+        en.append(f"{head} {zone}{dsuf}")
+        spne = _dist.spoken_distance_ne(g["dist"])
+        dsne = f", {spne}" if spne and spne not in ("ठीक अगाडि", "धेरै नजिक") else ""
+        nm = NE_NAMES.get(label, label)
+        nhead = nm if g["n"] == 1 else f"{NE_NUMS.get(g['n'], g['n'])} {nm}"
+        ne.append(f"{nhead} {NE_ZONES.get(zone, zone)}{dsne}")
+    return ("Around you: " + ", ".join(en) + ".", "तपाईं वरिपरि: " + ", ".join(ne) + "।")
 
 
 # --------------------------------------------------------------------------- #
